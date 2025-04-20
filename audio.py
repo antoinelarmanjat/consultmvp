@@ -152,7 +152,7 @@ def process_transcripts():
         # "[Speaker 1]: Hello Doctor Smith.\n[Speaker 2]: Hello patient, how are you feeling today?"
 
         print(f"[Processor] Received Segment:\n{segment}") # Example action
-
+        print("End Segment")
         # Example Action: Separate segments by speaker for analysis
         # speaker_texts = {}
         # try:
