@@ -45,7 +45,7 @@ def run_transcription():
 
     # --- *** DIARIZATION CONFIGURATION *** ---
     diarization_config = speech.SpeakerDiarizationConfig(
-        enable_speaker_diarization=True,
+        enable_speaker_diarization=False,
         min_speaker_count=EXPECTED_SPEAKERS, # Minimum number of speakers expected
         max_speaker_count=EXPECTED_SPEAKERS, # Maximum number of speakers expected (can be > min)
         # Speaker tags start at 1
