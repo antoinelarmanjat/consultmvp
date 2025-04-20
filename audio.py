@@ -143,9 +143,9 @@ def process_transcripts():
     while True:
         segment = processing_queue.get() # Blocks until an item is available
 
-        if segment is None:
-            print("Processing thread received stop signal.")
-            break
+        #if segment is None:
+        #    print("Processing thread received stop signal.")
+        #    break
 
         # --- Perform your actions on the DIARIZED 'segment' here ---
         # The 'segment' variable now contains text like:
