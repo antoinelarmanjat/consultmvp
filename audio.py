@@ -45,7 +45,7 @@ def run_transcription():
 
     # --- *** DIARIZATION CONFIGURATION *** ---
     diarization_config = speech.SpeakerDiarizationConfig(
-        enable_speaker_diarization=False,
+        enable_speaker_diarization=True,
         min_speaker_count=EXPECTED_SPEAKERS, # Minimum number of speakers expected
         max_speaker_count=EXPECTED_SPEAKERS, # Maximum number of speakers expected (can be > min)
         # Speaker tags start at 1
@@ -143,9 +143,9 @@ def process_transcripts():
     while True:
         segment = processing_queue.get() # Blocks until an item is available
 
-        #if segment is None:
-        #    print("Processing thread received stop signal.")
-        #    break
+        if segment is None:
+            print("Processing thread received stop signal.")
+            break
 
         # --- Perform your actions on the DIARIZED 'segment' here ---
         # The 'segment' variable now contains text like:
