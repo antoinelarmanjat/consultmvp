@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Conversation Transcript</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .transcript-section {
+            margin-top: 20px;
+            display: flex;
+            gap: 20px;
+        }
+        .transcript-column {
+            flex: 1;
+            padding: 20px;
+            border-radius: 4px;
+            background-color: #f8f9fa;
+            min-height: 200px;
+            max-height: 300px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+        .transcript-box {
+            padding: 10px;
+            background-color: white;
+            border-radius: 4px;
+            min-height: 150px;
+            font-family: monospace;
+        }
+        .transcript-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .transcript-title {
+            font-weight: bold;
+            color: #202124;
+        }
+        .transcript-version {
+            font-size: 0.8em;
+            color: #666;
+        }
+        .analysis-section {
+            margin-top: 30px;
+            display: flex;
+            gap: 20px;
+        }
+        .analysis-column {
+            flex: 1;
+            padding: 20px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+            min-height: 300px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .speaker-1 {
+            color: #1a73e8;
+            font-weight: bold;
+        }
+        .speaker-2 {
+            color: #34a853;
+            font-weight: bold;
+        }
+        h1 {
+            color: #202124;
+            margin-bottom: 20px;
+        }
+        h2 {
+            color: #202124;
+            font-size: 1.2em;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #ddd;
+        }
+        .question-item {
+            margin-bottom: 15px;
+            padding: 10px;
+            background-color: white;
+            border-radius: 4px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .answer-item {
+            margin-bottom: 15px;
+            padding: 10px;
+            background-color: white;
+            border-radius: 4px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .question-text {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .answer-text {
+            color: #666;
+        }
+        .status-pending {
+            color: #fbbc04;
+        }
+        .status-suggested {
+            color: #4285f4;
+        }
+        .status-asked {
+            color: #ea4335; /* Assuming 'asked' status might be used later */
+        }
+        .status-answered {
+            color: #34a853;
+        }
+        .version-selector {
+            margin-top: 10px;
+            padding: 5px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Conversation Transcript</h1>
+        <div class="transcript-section">
+            <div class="transcript-column">
+                <div class="transcript-header">
+                    <div class="transcript-title">Original Transcript</div>
+                </div>
+                <div id="original-transcript" class="transcript-box"></div>
+            </div>
+            <div class="transcript-column">
+                <div class="transcript-header">
+                    <div class="transcript-title">Corrected Transcript</div>
+                    <div class="transcript-version">Version: <span id="correction-version">0</span></div>
+                </div>
+                <div id="corrected-transcript" class="transcript-box"></div>
+                <select id="version-selector" class="version-selector">
+                    <option value="0">Current Version</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="analysis-section">
+            <div class="analysis-column">
+                <h2>Anamnesis</h2>
+                <div id="questions-list"></div>
+            </div>
+            <div class="analysis-column">
+                <h2>Question Answers</h2>
+                <div id="answers-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Explicitly prioritize websocket transport
+        const socket = io.connect('http://' + document.domain + ':' + location.port, {
+            transports: ['websocket', 'polling']
+        });
+
+        const originalTranscriptDiv = document.getElementById('original-transcript');
+        const correctedTranscriptDiv = document.getElementById('corrected-transcript');
+        const questionsList = document.getElementById('questions-list');
+        const answersList = document.getElementById('answers-list');
+        const versionSelector = document.getElementById('version-selector');
+        const correctionVersionSpan = document.getElementById('correction-version');
+
+        let transcriptSegments = [];
+        let correctedVersions = [];
+        let currentCorrectionVersionIndex = -1; // Use index to track current corrected version
+
+        // Debug logging
+        console.log('Attempting Socket connection...');
+        socket.on('connect', () => {
+            console.log('Socket connected successfully! Transport:', socket.io.engine.transport.name);
+            // Request initial state on connect
+            fetchInitialState();
+        });
+        socket.on('disconnect', () => {
+            console.log('Socket disconnected');
+        });
+        socket.on('connect_error', (error) => {
+            console.error('Socket connection error:', error);
+        });
+         socket.on('reconnect_error', function(error) {
+            console.error('Socket reconnection error:', error);
+        });
+        socket.on('reconnect', function(attemptNumber) {
+            console.log('Socket reconnected after', attemptNumber, 'attempts');
+            // Re-fetch initial state on reconnect to ensure UI is in sync
+            fetchInitialState();
+        });
+
+
+        // Function to format speaker text
+        function formatSpeakerText(text) {
+            if (!text) return ''; // Handle empty text
+            // console.log('Formatting text:', text); // Keep for debugging if needed
+            // Split the text into lines
+            const lines = text.split('\n');
+            let formattedText = '';
+
+            // Process each line
+            for (let line of lines) {
+                if (line.trim()) {
+                    // Replace speaker tags with formatted spans
+                    // Use a non-greedy match for the number (\d+?)
+                    line = line.replace(/\[Speaker (\d+?)\]:/g, '<span class="speaker-$1">Speaker $1:</span>');
+                    formattedText += line + '\n';
+                }
+            }
+
+            return formattedText;
+        }
+
+        // Function to update questions list
+        function updateQuestionsList(questions) {
+            questionsList.innerHTML = '';
+            questions.forEach(question => {
+                const div = document.createElement('div');
+                div.className = `question-item status-${question.status}`;
+                div.innerHTML = `
+                    <div class="question-text">${question.text}</div>
+                    <div class="status">Status: ${question.status}</div>
+                `;
+                questionsList.appendChild(div);
+            });
+        }
+
+        // Function to update answers list
+        function updateAnswersList(questions) {
+            answersList.innerHTML = '';
+            questions.forEach(question => {
+                if (question.status === 'answered' && question.answer) {
+                    const div = document.createElement('div');
+                    div.className = 'answer-item';
+                    div.innerHTML = `
+                        <div class="question-text">Q: ${question.text}</div>
+                        <div class="answer-text">A: ${question.answer}</div>
+                    `;
+                    answersList.appendChild(div);
+                }
+            });
+        }
+
+        // Handle new transcript segments
+        socket.on('new_transcript', function(data) {
+            console.log('Received new transcript segment:', data);
+            if (data && data.segment) {
+                // Append the new segment to our segments array
+                transcriptSegments.push(data.segment);
+                // Join all segments with newlines and update original transcript display
+                const currentOriginalTranscript = transcriptSegments.join('\n');
+                originalTranscriptDiv.innerHTML = formatSpeakerText(currentOriginalTranscript);
+                originalTranscriptDiv.scrollTop = originalTranscriptDiv.scrollHeight;
+
+                // If the corrected transcript is currently showing the "Current Version", update it too
+                if (versionSelector.value === 'current') {
+                     correctedTranscriptDiv.innerHTML = formatSpeakerText(currentOriginalTranscript);
+                     correctedTranscriptDiv.scrollTop = correctedTranscriptDiv.scrollHeight;
+                }
+            }
+        });
+
+        // Handle diarization correction updates
+        socket.on('diarization_correction', function(data) {
+            console.log('Received diarization correction:', data);
+            if (data && data.corrected) {
+                 // Add new version to the list
+                correctedVersions.push({
+                    original: data.original, // Store original for reference if needed
+                    corrected: data.corrected
+                });
+
+                // Update version selector
+                versionSelector.innerHTML = ''; // Clear existing options
+                correctedVersions.forEach((_, index) => {
+                    const option = document.createElement('option');
+                    option.value = index;
+                    option.textContent = `Version ${index + 1}`;
+                    versionSelector.appendChild(option);
+                });
+
+                // Add "Current Version" option
+                const currentOption = document.createElement('option');
+                currentOption.value = 'current';
+                currentOption.textContent = 'Current Version';
+                versionSelector.appendChild(currentOption);
+
+                // Set the selector to the latest corrected version and update display
+                currentCorrectionVersionIndex = correctedVersions.length - 1;
+                versionSelector.value = currentCorrectionVersionIndex; // Select the latest version by index
+                correctionVersionSpan.textContent = currentCorrectionVersionIndex + 1; // Display version number
+
+                correctedTranscriptDiv.innerHTML = formatSpeakerText(data.corrected);
+                correctedTranscriptDiv.scrollTop = correctedTranscriptDiv.scrollHeight;
+            }
+        });
+
+        // Handle version selection
+        versionSelector.addEventListener('change', function() {
+            const selectedValue = this.value;
+
+            if (selectedValue === 'current') {
+                // Show current original transcript
+                const currentOriginalTranscript = transcriptSegments.join('\n');
+                correctedTranscriptDiv.innerHTML = formatSpeakerText(currentOriginalTranscript);
+                correctionVersionSpan.textContent = 'Current'; // Update version display
+            } else {
+                // Show selected corrected version
+                const versionIndex = parseInt(selectedValue);
+                if (versionIndex >= 0 && versionIndex < correctedVersions.length) {
+                    const version = correctedVersions[versionIndex];
+                    correctedTranscriptDiv.innerHTML = formatSpeakerText(version.corrected);
+                    correctionVersionSpan.textContent = versionIndex + 1; // Update version display
+                }
+            }
+            correctedTranscriptDiv.scrollTop = correctedTranscriptDiv.scrollHeight;
+        });
+
+
+        // Handle question updates
+        socket.on('question_update', function(data) {
+            console.log('Received question update:', data);
+            if (data && data.questions) {
+                updateQuestionsList(data.questions);
+                updateAnswersList(data.questions);
+            }
+        });
+
+        // Function to fetch initial state via REST API
+        function fetchInitialState() {
+             console.log('Fetching initial state from /get_transcript...');
+             fetch('/get_transcript')
+                 .then(response => response.json())
+                 .then(data => {
+                     console.log('Initial state received:', data);
+                     if (data.transcript && data.transcript.length > 0) {
+                         // Store all segments and join them
+                         transcriptSegments = data.transcript;
+                         const initialOriginalTranscript = transcriptSegments.join('\n');
+                         originalTranscriptDiv.innerHTML = formatSpeakerText(initialOriginalTranscript);
+                         originalTranscriptDiv.scrollTop = originalTranscriptDiv.scrollHeight;
+
+                         // Set corrected transcript initially to the original
+                         correctedTranscriptDiv.innerHTML = formatSpeakerText(initialOriginalTranscript);
+                         correctedTranscriptDiv.scrollTop = correctedTranscriptDiv.scrollHeight;
+                         versionSelector.value = 'current'; // Select 'Current Version'
+                         correctionVersionSpan.textContent = 'Current'; // Update version display
+                     }
+
+                     // Note: Initial corrected_transcript from REST is removed in app.py,
+                     // corrections will arrive via SocketIO 'diarization_correction' events.
+
+                     if (data.questions) {
+                         updateQuestionsList(data.questions);
+                         updateAnswersList(data.questions);
+                     }
+                 })
+                 .catch(error => {
+                     console.error('Error fetching initial state:', error);
+                 });
+        }
+
+        // Fetch initial state when the script loads (in case SocketIO connects before fetch completes)
+        // Or rely solely on the fetch within the 'connect' handler for simplicity.
+        // Let's rely on the 'connect' handler for now.
+        // fetchInitialState(); // Removed to avoid potential race condition with SocketIO connect
+
+    </script>
+</body>
+</html>

@@ -1,8 +1,15 @@
-# audio.py (with Speaker Diarization)
+# audio.py (with Diarization and Vertex AI LLM Question Monitoring - Polling Mode)
 import time
 import queue
 import sys
 import threading
+import os
+from threading import Lock
+
+# --- Vertex AI Imports ---
+# These are kept but won't be used in this simplified polling mode
+import vertexai
+from vertexai.generative_models import GenerativeModel, Part, SafetySetting, HarmCategory
 
 # --- Audio Recording Imports ---
 import sounddevice as sd
@@ -14,22 +21,97 @@ from google.cloud import speech
 # --- Configuration ---
 SAMPLE_RATE = 16000
 CHUNK_SIZE = int(SAMPLE_RATE / 10)
-LANGUAGE_CODE = "en-US" # Adjust if needed (e.g., "fr-FR")
-EXPECTED_SPEAKERS = 1 # For Patient + Doctor conversation
+LANGUAGE_CODE = "en-US"
+EXPECTED_SPEAKERS = 2
+
+# --- Vertex AI Configuration ---
+# These are kept but won't be used in this simplified polling mode
+LLM_MODEL_NAME = "gemini-2.0-flash-001" # Vertex AI model identifier
+DIARIZATION_LLM_MODEL_NAME = "gemini-2.5-pro-preview-03-25" # Use a different model for correction if needed
+try:
+    GCP_PROJECT_ID = os.environ['GOOGLE_CLOUD_PROJECT']
+    GCP_LOCATION = os.environ['GOOGLE_CLOUD_LOCATION']
+except KeyError as e:
+    print(f"ERROR: Environment variable {e} not set.")
+    print("Please set GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION.")
+    sys.exit(1)
 
 # --- Global Variables & Queues ---
 audio_buffer = queue.Queue()
-processing_queue = queue.Queue()
-# full_transcript_parts = [] # Still optional for history
-# transcript_lock = threading.Lock() # Still optional
+# processing_queue is removed as run_transcription now updates transcript_segments directly
+# emission_queue is removed as we are not using SocketIO push
+questions_list = []  # Global questions list (kept for initial state route)
+questions_lock = threading.Lock()  # Lock for thread-safe access to questions_list
+questions_loaded = False  # Flag to track if questions have been loaded
+conversation_history = [] # Used by LLM processing (kept but won't grow in this mode)
+conversation_lock = Lock() # New: Also store segments for initial client load, updated by process_transcripts
+transcript_segments = [] # This list will now be updated by run_transcription
+transcript_lock = Lock() # Lock for thread-safe access to transcript_segments
 
-# --- Audio Recording Callback ---
+diarization_correction_history = [] # Store corrected versions (kept but won't grow)
+diarization_correction_lock = Lock()
+segment_count = 0 # Count segments processed (kept but won't grow)
+SEGMENTS_BEFORE_CORRECTION = 7 # (kept but won't be used)
+
+# We no longer pass socketio_instance to threads in this polling mode
+
+def get_current_questions():
+    """Returns a copy of the current questions list."""
+    with questions_lock:
+        return [q.copy() for q in questions_list]
+
+def get_transcript_segments():
+     """Returns a copy of the current transcript segments."""
+     with transcript_lock: # Use the lock when accessing transcript_segments
+         print(f"[GETTER] Getting {len(transcript_segments)} segments from transcript_segments.") # Added log
+         return transcript_segments.copy()
+
+def get_diarization_correction_history():
+     """Returns a copy of the diarization correction history."""
+     with diarization_correction_lock:
+         return diarization_correction_history.copy()
+
+
+# --- Helper Function to Load Questions (Unchanged) ---
+def load_questions(filename="questions.txt"):
+    """Loads questions from a file into a list of dictionaries."""
+    global questions_list, questions_loaded
+    with questions_lock:
+        if not questions_loaded:
+            questions_list = []
+            try:
+                with open(filename, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            questions_list.append({
+                                'text': line,
+                                'status': 'pending', # 'pending', 'suggested', 'asked', 'answered'
+                                'answer': None,
+                                'general': len(questions_list) < 3  # First 3 questions are general
+                            })
+                questions_loaded = True
+                print(f"Loaded {len(questions_list)} questions from {filename}")
+                print("Loaded questions:")
+                for q in questions_list:
+                    print(f"  - {q['text']} (status: {q['status']}, general: {q['general']})")
+                return questions_list
+            except FileNotFoundError:
+                print(f"ERROR: {filename} not found. Please create it.")
+                return []
+        else:
+            print("Questions already loaded, returning existing list")
+            return questions_list
+
+
+# --- Audio Recording Callback (Unchanged) ---
 def audio_callback(indata, frames, time_info, status):
     if status:
-        print(status, file=sys.stderr)
+        # Handle status if needed, e.g., stream overflow
+        pass # For now, just ignore status
     audio_buffer.put(bytes(indata))
 
-# --- Generator for Audio Stream to API ---
+# --- Generator for Audio Stream to API (Unchanged) ---
 def audio_generator():
     while True:
         chunk = audio_buffer.get()
@@ -37,171 +119,132 @@ def audio_generator():
             break
         yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
-# --- Speech-to-Text Thread Function ---
-def run_transcription():
-    # global full_transcript_parts # Uncomment if using the history list
-
+# --- Speech-to-Text Thread Function (MODIFIED to update transcript_segments directly) ---
+# No longer uses processing_queue or emits SocketIO events
+def run_transcription(): # Removed processing_queue and socketio_instance arguments
     client = speech.SpeechClient()
 
-    # --- *** DIARIZATION CONFIGURATION *** ---
+    # --- Configuration ---
+    # Diarization config is kept, but diarization results won't be processed by LLM in this mode
     diarization_config = speech.SpeakerDiarizationConfig(
         enable_speaker_diarization=True,
-        min_speaker_count=EXPECTED_SPEAKERS, # Minimum number of speakers expected
-        max_speaker_count=EXPECTED_SPEAKERS, # Maximum number of speakers expected (can be > min)
-        # Speaker tags start at 1
+        min_speaker_count=EXPECTED_SPEAKERS,
+        max_speaker_count=EXPECTED_SPEAKERS,
     )
-    # ---------------------------------------
-
     recognition_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=SAMPLE_RATE,
         language_code=LANGUAGE_CODE,
         enable_automatic_punctuation=True,
-        # --- *** ADD DIARIZATION CONFIG *** ---
         diarization_config=diarization_config,
-        # ------------------------------------
-        # ------------------------------------
-        # model="medical_conversation", # Consider specialized models
-        # use_enhanced=True,
-        # --- Enable word-level confidence and speaker tags ---
-        # These are often enabled implicitly by diarization, but explicit is safe
-        enable_word_confidence=True, # Not strictly needed for tags, but good practice
-        # Diarization implicitly requires word-level details
+        enable_word_confidence=True, # Keep this, it helps inspect word details
     )
     streaming_config = speech.StreamingRecognitionConfig(
         config=recognition_config,
         interim_results=True,
     )
-
-    print("Starting Google Cloud Speech-to-Text stream with Diarization...")
+    print("\n[Transcription Thread] Starting Google Cloud Speech-to-Text stream...")
     requests = audio_generator()
+    stream_ended_normally = False # Flag to check if loop finishes
 
     try:
         responses = client.streaming_recognize(
             config=streaming_config,
             requests=requests,
         )
+        print("[Transcription Thread] Receiving responses from Google API...")
 
-        for response in responses:
+        # --- Log each response received ---
+        for i, response in enumerate(responses):
+            sys.stdout.flush()
+
             if not response.results:
+                print("-> No results in response.")
                 continue
 
             result = response.results[0]
+            sys.stdout.flush()
+
             if not result.alternatives:
+                print("-> No alternatives in result.")
                 continue
 
-            # Process interim results (without speaker tags usually)
+            # Always print interim results for user feedback
             if not result.is_final:
-                transcript_chunk = result.alternatives[0].transcript
-                print(f"Interim: {transcript_chunk}", end='\r')
-                continue # Skip to next response for interim
+                interim_transcript = result.alternatives[0].transcript
+                print(f"Interim: {interim_transcript}", end='\r') # Use \r to overwrite line
+                sys.stdout.flush()
+                continue # Go to the next response
 
-            # --- *** PROCESS FINAL RESULT WITH DIARIZATION *** ---
+            # --- This block is ONLY reached if result.is_final is True ---
+            print(f"\n[Transcription Thread] Final Segment {i+1} received.")
+            sys.stdout.flush()
+
             final_alternative = result.alternatives[0]
             if not final_alternative.words:
-                print("Warning: Final result received without word info, skipping diarization for this segment.")
+                print("[Transcription Thread] Final result has no words.")
                 continue
 
-            diarized_segment = ""
-            current_speaker_tag = None # Track the speaker tag for the current word sequence
+            # --- Diarization/Formatting (Only if diarization is enabled) ---
+            if hasattr(recognition_config, 'diarization_config') and recognition_config.diarization_config.enable_speaker_diarization:
+                 diarized_segment = ""
+                 current_speaker_tag = None
+                 for word_info in final_alternative.words:
+                     tag = word_info.speaker_tag if hasattr(word_info, 'speaker_tag') else 0
+                     word_text = word_info.word
 
-            for word_info in final_alternative.words:
-                # word_info contains: word, start_time, end_time, confidence, speaker_tag
-                if current_speaker_tag is None or word_info.speaker_tag != current_speaker_tag:
-                    # Speaker change detected or first word
-                    if current_speaker_tag is not None:
-                         diarized_segment += "\n" # Add newline between speaker turns for clarity
-                    current_speaker_tag = word_info.speaker_tag
-                    diarized_segment += f"[Speaker {current_speaker_tag}]: {word_info.word}"
-                else:
-                    # Same speaker, just append the word
-                    diarized_segment += f" {word_info.word}"
+                     if current_speaker_tag is None or tag != current_speaker_tag:
+                         if current_speaker_tag is not None:
+                            diarized_segment += "\n"
+                         current_speaker_tag = tag
+                         diarized_segment += f"[Speaker {current_speaker_tag}]: {word_text}"
+                     else:
+                         diarized_segment += f" {word_text}"
+            else:
+                 diarized_segment = final_alternative.transcript
+                 print("[Transcription Thread] Diarization disabled, using raw transcript.")
 
-            print(f"Final Segment:\n{diarized_segment}") # Console feedback
+            print(f"\n[Transcription Thread] --- FINAL DIARIZED SEGMENT ----\n{diarized_segment}\n------------------------------------")
 
-            # Put the fully constructed diarized segment onto the processing queue
-            processing_queue.put(diarized_segment)
+            # --- Append the final segment to the global transcript_segments list ---
+            with transcript_lock: # Use the lock when modifying the shared list
+                transcript_segments.append(diarized_segment)
+                print(f"[Transcription Thread] Appended segment to transcript_segments. Total segments: {len(transcript_segments)}")
 
-            # --- Optional: Store in historical list (if needed) ---
-            # with transcript_lock:
-            #     full_transcript_parts.append(diarized_segment)
-            # ------------------------------------------------------
 
-            # --- *** END OF DIARIZATION PROCESSING *** ---
+        # --- End of the 'for response in responses:' loop ---
+        stream_ended_normally = True
+        print("\n[Transcription Thread] 'responses' iterator finished.")
 
     except Exception as e:
-        print(f"Error during transcription stream: {e}")
+        print(f"\n[Transcription Thread] !!! FATAL ERROR during transcription stream: {type(e).__name__}: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+
     finally:
-        print("Transcription stream stopped.")
-        processing_queue.put(None) # Signal processing thread to stop
+        print(f"\n[Transcription Thread] Transcription stream thread stopping. Stream ended normally: {stream_ended_normally}.")
+        # No queues to signal stop to in this simplified mode
 
 
-# --- Transcript Processing Thread Function ---
-def process_transcripts():
-    """Runs in a separate thread, processing DIARIZED transcript segments."""
-    print("Processing thread started, waiting for diarized segments...")
-    while True:
-        segment = processing_queue.get() # Blocks until an item is available
-
-        if segment is None:
-            print("Processing thread received stop signal.")
-            break
-
-        # --- Perform your actions on the DIARIZED 'segment' here ---
-        # The 'segment' variable now contains text like:
-        # "[Speaker 1]: Hello Doctor Smith.\n[Speaker 2]: Hello patient, how are you feeling today?"
-
-        print(f"[Processor] Received Segment:\n{segment}") # Example action
-        print("End Segment")
-        # Example Action: Separate segments by speaker for analysis
-        # speaker_texts = {}
-        # try:
-        #     for line in segment.strip().split('\n'):
-        #         if line.startswith("[Speaker"):
-        #             parts = line.split("]: ", 1)
-        #             if len(parts) == 2:
-        #                 speaker_tag = parts[0].split(" ")[1] # Extract tag number
-        #                 text = parts[1]
-        #                 if speaker_tag not in speaker_texts:
-        #                     speaker_texts[speaker_tag] = []
-        #                 speaker_texts[speaker_tag].append(text)
-        #     print(f"[Processor] Parsed Speaker Texts: {speaker_texts}")
-
-            # Now you could, for example, send only Speaker 1's text to one Gemini prompt
-            # and Speaker 2's text to another, or analyze turn-taking, etc.
-
-        # except Exception as e:
-        #     print(f"[Processor] Error parsing diarized segment: {e}")
-
-        # Add your other specific actions here, operating on the diarized segment.
-        # ----------------------------------------------------
-
-    print("Processing thread finished.")
+# --- process_transcripts thread function is removed in this polling mode ---
+# --- diarization_correction_thread function is removed in this polling mode ---
+# --- socketio_emitter_thread function is removed in this polling mode ---
+# --- emission_queue is removed ---
+# --- handle_diarization_correction is removed ---
 
 
-# --- Main Execution Block (Largely unchanged, ensure imports/config at top are updated) ---
+# --- Main Execution Block (Adjusted for passing socketio if run standalone) ---
+# Note: This __main__ block is typically not used when run via app.py,
+# but kept for completeness if you wanted to test audio.py directly (without Flask/SocketIO)
 if __name__ == "__main__":
-    # --- Prerequisites Reminder ---
-    # 1. Google Cloud Project with Speech-to-Text API enabled.
-    # 2. `pip install google-cloud-speech sounddevice numpy`
-    # 3. Authenticated via `gcloud auth application-default login`
-    # 4. Diarization might have language/model limitations - check docs if issues arise.
-    # --------------------------------
-
-    print("Starting audio processing application with Speaker Diarization...")
-    try:
-        print(f"Using input device: {sd.query_devices(kind='input')['name']}")
-    except Exception as e:
-        print(f"Could not query audio devices: {e}. Using default.")
-
-    print(f"Sample rate: {SAMPLE_RATE}, Chunk size: {CHUNK_SIZE}, Language: {LANGUAGE_CODE}, Speakers: {EXPECTED_SPEAKERS}")
+    print("Starting audio processing application with Diarization and Vertex AI LLM Monitoring (Standalone Polling Mode)...")
+    print("Note: This mode only transcribes and stores segments. It does not serve a web page or perform LLM analysis.")
 
     # --- Start Threads ---
+    # We only need the transcription thread
     transcription_thread = threading.Thread(target=run_transcription, daemon=True)
-    processing_thread = threading.Thread(target=process_transcripts, daemon=True)
 
     transcription_thread.start()
-    processing_thread.start()
 
     # --- Start Recording Audio ---
     stream = None
@@ -216,31 +259,31 @@ if __name__ == "__main__":
         stream.start()
         print("Recording started. Press Ctrl+C to stop.")
 
-        while transcription_thread.is_alive() and processing_thread.is_alive():
+        # Keep main thread alive while the transcription thread is alive
+        while transcription_thread.is_alive():
             time.sleep(0.1)
 
     except KeyboardInterrupt:
-        print("\nCtrl+C received. Stopping recording and processing...")
-        audio_buffer.put(None) # Signal audio generator
+        print("\nCtrl+C received. Stopping recording...")
+        audio_buffer.put(None) # Signal audio generator to stop
 
     except Exception as e:
-        print(f"\nAn unexpected error occurred in the main loop: {e}")
-        if audio_buffer.empty():
-             audio_buffer.put(None)
+        print(f"\nAn unexpected error occurred in the main loop: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        # Ensure thread is signaled to stop even on other errors
+        if audio_buffer.empty(): audio_buffer.put(None)
+
 
     finally:
-        # --- Cleanup ---
+        # Cleanup
         if stream and stream.active:
              print("Stopping audio stream...")
              stream.stop()
              stream.close()
 
         print("Waiting for threads to finish...")
-        if transcription_thread.is_alive():
-            transcription_thread.join(timeout=5)
-        if processing_thread.is_alive():
-            processing_thread.join(timeout=5)
+        # transcription_thread.join(timeout=5) # Join the transcription thread
 
-        print("All threads finished.")
-        print("Application finished.")
 
+        print("Application finishing.")
