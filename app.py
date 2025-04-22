@@ -5,6 +5,8 @@ import threading
 import queue
 import sounddevice as sd
 import numpy as np
+import sqlite3
+import random
 
 # Import necessary functions and global variables from audio.stable.py
 from audio_stable import (
@@ -59,6 +61,43 @@ def get_transcript():
         'questions': questions,
         'corrections': corrections
     })
+
+# --- Route to get random patient data ---
+@app.route('/get_random_patient')
+def get_random_patient():
+    conn = sqlite3.connect('patients.db')
+    cursor = conn.cursor()
+    
+    # Get total number of patients
+    cursor.execute('SELECT COUNT(*) FROM patients')
+    total_patients = cursor.fetchone()[0]
+    
+    # Get a random patient
+    random_id = random.randint(1, total_patients)
+    cursor.execute('''
+        SELECT first_name, last_name, date_of_birth, weight, 
+               allergies, smokes, medications, last_visit_reason, last_visit_date
+        FROM patients 
+        WHERE id = ?
+    ''', (random_id,))
+    
+    patient = cursor.fetchone()
+    conn.close()
+    
+    if patient:
+        return jsonify({
+            'first_name': patient[0],
+            'last_name': patient[1],
+            'date_of_birth': patient[2],
+            'weight': patient[3],
+            'allergies': patient[4],
+            'smokes': patient[5],
+            'medications': patient[6],
+            'last_visit_reason': patient[7],
+            'last_visit_date': patient[8]
+        })
+    else:
+        return jsonify({'error': 'No patient found'}), 404
 
 # --- Function to start audio processing threads (MODIFIED for polling) ---
 def start_audio_processing():
