@@ -15,6 +15,7 @@ from audio_stable import (
     get_diarization_correction_history, # Keep getter for history (won't update in this mode)
     audio_buffer, audio_callback, SAMPLE_RATE, CHUNK_SIZE, # Keep audio recording components
     process_transcripts, # Keep process_transcripts function
+    diarization_correction_thread, # Add diarization correction thread
     # We will NOT be using process_transcripts, diarization_correction_thread,
     # socketio_emitter_thread, or emission_queue in this polling version.
 )
@@ -52,9 +53,11 @@ def index():
 def get_transcript():
     segments = get_transcript_segments()
     questions = get_current_questions()
+    corrections = get_diarization_correction_history()
     return jsonify({
         'segments': segments,
-        'questions': questions
+        'questions': questions,
+        'corrections': corrections
     })
 
 # --- Function to start audio processing threads (MODIFIED for polling) ---
@@ -65,18 +68,31 @@ def start_audio_processing():
     processing_queue = queue.Queue()
 
     # Start the transcription thread, passing the queue.
-    # We no longer pass socketio_instance as we are not emitting from this thread.
     transcription_thread = threading.Thread(
         target=run_transcription,
-        args=(processing_queue, None), # Pass None for socketio_instance
+        args=(processing_queue,), # Pass only the queue
         daemon=True # Thread will exit when main program exits
     )
 
-    # We are NOT starting process_transcripts, diarization_correction_thread, or socketio_emitter_thread
+    # Start the processing thread
+    processing_thread = threading.Thread(
+        target=process_transcripts,
+        args=(processing_queue,), # Pass only the queue
+        daemon=True
+    )
+
+    # Start the diarization correction thread
+    correction_thread = threading.Thread(
+        target=diarization_correction_thread,
+        args=(processing_queue,), # Pass only the queue
+        daemon=True
+    )
 
     transcription_thread.start()
+    processing_thread.start()
+    correction_thread.start()
 
-    print("Transcription thread started.")
+    print("All audio processing threads started.")
 
 # --- Main execution block (Modified for Polling Approach) ---
 if __name__ == '__main__':
