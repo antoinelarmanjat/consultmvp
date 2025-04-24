@@ -27,12 +27,8 @@ app = Flask(__name__)
 # Make sure SECRET_KEY is actually set in a real app, not just 'secret!'
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'a_default_secret_key_for_dev')
 
-# We are removing SocketIO for now
-# from flask_socketio import SocketIO
-# socketio = SocketIO(app)
-
-# Global variables for transcript storage are managed in audio.py,
-# we access them via getter functions.
+# Global variable to store current patient ID
+current_patient_id = None
 
 # Create a queue for processing
 processing_queue = queue.Queue()
@@ -65,6 +61,7 @@ def get_transcript():
 # --- Route to get random patient data ---
 @app.route('/get_random_patient')
 def get_random_patient():
+    global current_patient_id
     conn = sqlite3.connect('patients.db')
     cursor = conn.cursor()
     
@@ -74,6 +71,8 @@ def get_random_patient():
     
     # Get a random patient
     random_id = random.randint(1, total_patients)
+    current_patient_id = random_id  # Update the global patient ID
+    
     cursor.execute('''
         SELECT first_name, last_name, date_of_birth, weight, 
                allergies, smokes, medications, last_visit_reason, last_visit_date
@@ -116,7 +115,7 @@ def start_audio_processing():
     # Start the processing thread
     processing_thread = threading.Thread(
         target=process_transcripts,
-        args=(processing_queue,), # Pass only the queue
+        args=(processing_queue, current_patient_id), # Pass the queue and current patient ID
         daemon=True
     )
 
@@ -139,6 +138,14 @@ if __name__ == '__main__':
 
     # Load questions at startup in the main process
     load_questions()
+
+    # Get initial random patient ID
+    conn = sqlite3.connect('patients.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM patients')
+    total_patients = cursor.fetchone()[0]
+    current_patient_id = random.randint(1, total_patients)
+    conn.close()
 
     # Start only the transcription thread
     start_audio_processing()

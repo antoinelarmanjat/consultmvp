@@ -5,6 +5,8 @@ import sys
 import threading
 import os
 from threading import Lock
+import sqlite3
+from datetime import datetime
 
 # --- Vertex AI Imports ---
 import vertexai
@@ -85,7 +87,7 @@ def load_questions(filename="questions.txt"):
                                 'text': line,
                                 'status': 'pending', # 'pending', 'suggested', 'asked', 'answered'
                                 'answer': None,
-                                'general': len(questions_list) < 3  # First 3 questions are general
+                                'general': len(questions_list) < 5  # First 5 questions are general
                             })
                 questions_loaded = True
                 print(f"Loaded {len(questions_list)} questions from {filename}")
@@ -143,29 +145,28 @@ def run_transcription(processing_queue):
     )
     print("\n[Transcription Thread] Starting Google Cloud Speech-to-Text stream...")
     requests = audio_generator()
-    stream_ended_normally = False # Flag to check if loop finishes
+    stream_ended_normally = False
 
     try:
         responses = client.streaming_recognize(
             config=streaming_config,
             requests=requests,
         )
-        print("[Transcription Thread] Receiving responses from Google API...")
+        #print("[Transcription Thread] Receiving responses from Google API...")
 
         # --- Log each response received ---
         # Iterate through responses. This loop blocks until a response is available.
         for i, response in enumerate(responses):
             # Use sys.stdout.flush() to ensure prints appear immediately,
             # especially with the '\r' from the interim print.
-            #print(f"\n[Transcription Thread] Received response {i+1}.", end=' ')
             sys.stdout.flush()
 
             if not response.results:
-                print("-> No results in response.")
+                #print("-> No results in response.")
                 continue
 
             result = response.results[0]
-            print(f"-> is_final: {result.is_final}.", end=' ')
+            #print(f"-> is_final: {result.is_final}.", end=' ')
             sys.stdout.flush()
 
             if not result.alternatives:
@@ -175,20 +176,18 @@ def run_transcription(processing_queue):
             # Always print interim results for user feedback
             if not result.is_final:
                 interim_transcript = result.alternatives[0].transcript
-                print(f"Interim: {interim_transcript}", end='\r') # Use \r to overwrite line
+                #print(f"Interim: {interim_transcript}", end='\r') # Use \r to overwrite line
                 sys.stdout.flush()
                 continue # Go to the next response
 
             # --- This block is ONLY reached if result.is_final is True ---
             # Overwrite the interim line with the final segment info
-            print(f"\n[Transcription Thread] Final Segment {i+1} received.")
+            #print(f"\n[Transcription Thread] Final Segment {i+1} received.")
             sys.stdout.flush()
 
             final_alternative = result.alternatives[0]
             if not final_alternative.words:
                 print("[Transcription Thread] Final result has no words.")
-                # Although it's final, if it has no words, maybe don't process/emit?
-                # For now, let's skip if no words, but log it.
                 continue
 
             # --- Diarization/Formatting (Only if diarization is enabled) ---
@@ -196,11 +195,10 @@ def run_transcription(processing_queue):
             if hasattr(recognition_config, 'diarization_config') and recognition_config.diarization_config.enable_speaker_diarization:
                  diarized_segment = ""
                  current_speaker_tag = None
-                 print("[Transcription Thread] Processing words with diarization tags:")
+                 #print("[Transcription Thread] Processing words with diarization tags:")
                  for word_info in final_alternative.words:
                      tag = word_info.speaker_tag if hasattr(word_info, 'speaker_tag') else 0 # Default to 0 if tag is missing for some reason
                      word_text = word_info.word
-                     #print(f"  Word: '{word_text}', Speaker Tag: {tag}, Confidence: {word_info.confidence}") # Log word details
 
                      if current_speaker_tag is None or tag != current_speaker_tag:
                          if current_speaker_tag is not None:
@@ -209,58 +207,50 @@ def run_transcription(processing_queue):
                          diarized_segment += f"[Speaker {current_speaker_tag}]: {word_text}"
                      else:
                          diarized_segment += f" {word_text}"
-                 print("[Transcription Thread] Finished processing words.")
+                 #print("[Transcription Thread] Finished processing words.")
 
             else:
                  # If diarization is disabled, just get the raw transcript
                  diarized_segment = final_alternative.transcript
-                 print("[Transcription Thread] Diarization disabled, using raw transcript.")
+                 #print("[Transcription Thread] Diarization disabled, using raw transcript.")
 
-
-            print(f"\n[Transcription Thread] --- FINAL DIARIZED SEGMENT ---\n{diarized_segment}\n------------------------------------")
+            # Print only the diarized final result
+            print("\n[Transcription Thread] --- FINAL DIARIZED SEGMENT ---")
+            print(diarized_segment)
+            print("------------------------------------")
 
             # --- Process and Emit the Final Segment ---
             print(f"[DEBUG-EMIT] Attempting to put segment in processing queue...")
             processing_queue.put(diarized_segment)
             print("[DEBUG-EMIT] Segment put in queue.")
 
-            # Immediately emit the segment via SocketIO for the original transcript display
-            """
-            try:
-                 print("[DEBUG-EMIT] Attempting to emit 'new_transcript'...")
-                 socketio_instance.emit('new_transcript', {'segment': diarized_segment})
-                 print("[DEBUG-EMIT] Successfully emitted 'new_transcript'.")
-            except Exception as e:
-                 print(f"[DEBUG-EMIT] Error emitting new_transcript via SocketIO: {type(e).__name__}: {e}", file=sys.stderr)
-                 # Consider sys.exit(1) here if emitting is critical and failing
-            """
-            print("[Transcription Thread] Finished processing final segment.")
+            #print("[Transcription Thread] Finished processing final segment.")
 
 
         # --- End of the 'for response in responses:' loop ---
         # This line is only reached if the 'responses' iterator finishes without error (e.g., audio_generator yielded None)
         stream_ended_normally = True
-        print("\n[Transcription Thread] 'responses' iterator finished.")
+        #print("\n[Transcription Thread] 'responses' iterator finished.")
 
     except Exception as e:
         # Catch any exception that occurs during the streaming or processing loop
-        print(f"\n[Transcription Thread] !!! FATAL ERROR during transcription stream: {type(e).__name__}: {e}", file=sys.stderr)
+        #print(f"\n[Transcription Thread] !!! FATAL ERROR during transcription stream: {type(e).__name__}: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc() # Print the full traceback for debugging
 
     finally:
         # This block always runs when the try or except block finishes
-        print(f"\n[Transcription Thread] Transcription stream thread stopping. Stream ended normally: {stream_ended_normally}.")
+        #print(f"\n[Transcription Thread] Transcription stream thread stopping. Stream ended normally: {stream_ended_normally}.")
         # Signal stop to processing threads. Putting None multiple times is safe.
-        print("[Transcription Thread] Signaling processing queue to stop.")
+        #rint("[Transcription Thread] Signaling processing queue to stop.")
         processing_queue.put(None) # Stop the processing thread
 
 
 # --- Transcript Processing Thread Function (MODIFIED to remove callback and emit question_update) ---
 # Now accepts socketio instance to emit question_update directly
-def process_transcripts(processing_queue):
+def process_transcripts(processing_queue, patient_id):
     """Runs in a separate thread, processing segments, managing questions, and updating history."""
-    global segment_count, conversation_history, transcript_segments # Add transcript_segments
+    global segment_count, conversation_history, transcript_segments
 
     print("Processing thread started, loading questions...")
     load_questions() # Load questions at the start
@@ -288,67 +278,122 @@ def process_transcripts(processing_queue):
         print(f"ERROR: Could not load Vertex AI model '{LLM_MODEL_NAME}' for questions: {e}")
         return
 
-    initial_suggestions_done = False
+    # --- Initial Question Analysis (Moved from while loop) ---
+    print("\n" + "="*15 + " Initial General Questions " + "="*15)
+    
+    # Get patient info from database using the provided patient_id
+    patient_info = get_patient_info(patient_id)
+    
+    if patient_info:
+        print(f"Found patient info: {patient_info}")
+        print(f"FOUND QUESTIONS LIST: {questions_list}")
+        
+        # Create a prompt for the LLM to analyze which questions are already answered
+        db_info_prompt = f"""
+        Here is the patient information from the database:
+        {patient_info}
+        
+        Here is the list of questions that need to be asked:
+        {[q['text'] for q in questions_list if q['general'] and q['status'] == 'pending']}
+        
+        For each question, determine if the information is already available in the database.
+        If yes, provide the answer from the database.
+        If no, mark it as needing to be asked.
+        
+        If the question is about age and you have the birthdate, use the calculated age.
+        For smoking status, use "Yes" for smokers and "No" for non-smokers.
+        
+        Respond with a JSON array of objects, where each object has:
+        - question: the exact question text from the list
+        - answer: either the answer from the database or "needs to be asked"
+        
+        Example format:
+        [
+            {{"question": "Do you smoke?", "answer": "No"}},
+            {{"question": "What is your age?", "answer": "26"}},
+            {{"question": "What are your allergies?", "answer": "needs to be asked"}}
+        ]
+        
+        Only include questions from the provided list. Do not add any other text or explanation.
+        """
+        
+        try:
+            response = model.generate_content(db_info_prompt, safety_settings=safety_settings)
+            analysis = response.text.strip()
+            print("ANALYSIS", analysis)
+            
+            # Clean up the response by removing markdown code block markers
+            if analysis.startswith('```json'):
+                analysis = analysis[7:]  # Remove ```json
+            if analysis.endswith('```'):
+                analysis = analysis[:-3]  # Remove ```
+            analysis = analysis.strip()  # Remove any extra whitespace
+            
+            # Parse the JSON response
+            import json
+            try:
+                answers = json.loads(analysis)
+                
+                # Update questions based on the answers
+                for answer in answers:
+                    question_text = answer['question']
+                    answer_text = answer['answer']
+                    
+                    # Find and update the question in our list
+                    for question in questions_list:
+                        if question['text'] == question_text and question['status'] == 'pending':
+                            if answer_text != "needs to be asked":
+                                question['status'] = 'answered'
+                                question['answer'] = answer_text
+                                print(f"Question already answered from database: {question_text}")
+                                print(f"Answer: {answer_text}")
+                            else:
+                                question['status'] = 'suggested'
+                                print(f"Question needs to be asked: {question_text}")
+                            break
+            
+            except json.JSONDecodeError as e:
+                print(f"Error parsing LLM response as JSON: {e}")
+                print(f"Raw response after cleanup: {analysis}")
+                # Fallback to suggesting all questions if JSON parsing fails
+                for question in questions_list:
+                    if question['general'] and question['status'] == 'pending':
+                        question['status'] = 'suggested'
+        
+        except Exception as e:
+            print(f"Error analyzing database info with LLM: {e}")
+            # Fallback to suggesting all questions if LLM analysis fails
+            for question in questions_list:
+                if question['general'] and question['status'] == 'pending':
+                    question['status'] = 'suggested'
+    else:
+        print("No patient info found in database, suggesting all general questions")
+        # If no patient info, suggest all general questions
+        for question in questions_list:
+            if question['general'] and question['status'] == 'pending':
+                question['status'] = 'suggested'
+    
+    print("="*51 + "\n")
+    initial_suggestions_done = True
 
+    # --- Main Processing Loop ---
     while True:
-        # Get a segment from the queue - this is where the delay was perceived by the UI
-        # because this thread was blocked by LLM calls on the *previous* segment.
-        # Now, the UI gets the segment earlier from run_transcription.
         segment = processing_queue.get()
-
-        print("XXXXXXXXXXX")
 
         if segment is None:
             print("Processing thread received stop signal.")
             break
 
-        print("YYYYYYYYY")
-
         print(f"\n[Processor] Processing Segment:\n{segment}\n-----------------------------")
 
-
-        # --- MODIFICATION START ---
-        # Update conversation history (for LLM context)
+        # Update conversation history
         with conversation_lock:
             conversation_history.append(segment)
             segment_count += 1
-            # print(f"Updated conversation history (count: {len(conversation_history)}, segments: {segment_count}):\n{segment}\n")
 
-        print("ZZZZZZZZZZ")
-
-        # Also update transcript_segments for initial client load / get_transcript route
+        # Update transcript segments
         with transcript_lock:
-             transcript_segments.append(segment)
-        # --- MODIFICATION END ---
-
-        print("TTTTTTTTT",initial_suggestions_done)
-        # --- 1. Initial General Question Suggestions (Unchanged) ---
-        if not initial_suggestions_done:
-            with questions_lock:
-
-                print("\n" + "="*15 + " Initial General Questions " + "="*15)
-                general_questions_to_suggest = [
-                    q for q in questions_list if q['general'] and q['status'] == 'pending'
-                ]
-                if general_questions_to_suggest:
-                    print("[System Initial Suggestions (General)]:")
-                    for question in general_questions_to_suggest:
-                        print(f"  - {question['text']}")
-                        question['status'] = 'suggested' # Mark as suggested
-                        print(f"Updated question: {question['text']} (status: {question['status']})")
-                    # --- MODIFICATION: Emit question update after initial suggestions ---
-                    """
-                    try:
-                         socketio_instance.emit('question_update', {'questions': get_current_questions()})
-                         print("Emitted initial question_update.") # Optional debug print
-                    except Exception as e:
-                         print(f"Error emitting initial question_update: {e}", file=sys.stderr)
-                    """
-                else:
-                    print("[System]: No pending general questions found.")
-                print("="*51 + "\n")
-            initial_suggestions_done = True
-
+            transcript_segments.append(segment)
 
         # --- 2. Check for Answers (Unchanged logic, emit question_update after) ---
         # Process this segment to see if it answers any *currently suggested* questions
@@ -393,15 +438,6 @@ def process_transcripts(processing_queue):
 
                 except Exception as e:
                     print(f"[Processor] ERROR during Vertex AI API call for answer check '{question['text']}': {e}")
-
-        # --- MODIFICATION: Emit question update if any answers were found ---
-       
-        #if updated_questions_during_segment_processing:
-         #   try:
-         #        socketio_instance.emit('question_update', {'questions': get_current_questions()})
-         #        # print("Emitted question_update after answer check.") # Optional debug print
-         #   except Exception as e:
-         #        print(f"Error emitting question_update after answer check: {e}", file=sys.stderr)
 
         # --- 3. Ongoing Contextual Question Suggestions (Unchanged logic, emit question_update after) ---
         # Suggest new questions based on the full context
@@ -465,21 +501,6 @@ def process_transcripts(processing_queue):
                         print(f"[Processor] ERROR during Vertex AI API call for question suggestion: {e}")
                 # else:
                 #      print("[Processor]: No pending contextual questions to suggest.") # Optional debug print
-
-
-        # --- MODIFICATION: Emit question update if any new suggestions were made ---
-        
-        """if updated_suggestions_during_segment_processing:
-            try:
-                 socketio_instance.emit('question_update', {'questions': get_current_questions()})
-                 # print("Emitted question_update after suggestion check.") # Optional debug print
-            except Exception as e:
-                 print(f"Error emitting question_update after suggestion check: {e}", file=sys.stderr)
-        """
-        # --- End of Processing for This Segment ---
-        # The thread loops back to get the next segment from the queue
-        # The time spent waiting for LLM calls directly impacts how quickly it gets the *next* segment
-
 
     # Final status print (unchanged)
     print("\n--- Final Question Status ---")
@@ -587,6 +608,43 @@ def handle_diarization_correction(data, socketio_instance):
     except Exception as e:
         print(f"Error handling diarization correction callback: {e}", file=sys.stderr)
 
+def get_patient_info(patient_id):
+    """Get patient information from the database."""
+    try:
+        conn = sqlite3.connect('patients.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT first_name, last_name, date_of_birth, weight, allergies, smokes, medications, last_visit_reason, last_visit_date
+            FROM patients
+            WHERE id = ?
+        ''', (patient_id,))
+        patient = cursor.fetchone()
+        conn.close()
+        
+        if patient:
+            # Calculate age if birthdate is present
+            age = None
+            if patient[2]:  # date_of_birth
+                birthdate = datetime.strptime(patient[2], '%Y-%m-%d')
+                today = datetime.now()
+                age = today.year - birthdate.year - ((today.month, today.day) < (birthdate.month, birthdate.day))
+            
+            return {
+                'first_name': patient[0],
+                'last_name': patient[1],
+                'date_of_birth': patient[2],
+                'age': age,
+                'weight': patient[3],
+                'allergies': patient[4],
+                'smokes': "Yes" if patient[5] == 1 else "No" if patient[5] == 0 else None,
+                'medications': patient[6],
+                'last_visit_reason': patient[7],
+                'last_visit_date': patient[8]
+            }
+        return None
+    except Exception as e:
+        print(f"Error getting patient info: {e}")
+        return None
 
 # --- Main Execution Block (Adjusted for passing socketio if run standalone) ---
 # Note: This __main__ block is typically not used when run via app.py,
@@ -613,7 +671,7 @@ if __name__ == "__main__":
     processing_queue = queue.Queue()
     # Pass dummy_socketio to threads
     transcription_thread = threading.Thread(target=run_transcription, args=(processing_queue,), daemon=True)
-    processing_thread = threading.Thread(target=process_transcripts, args=(processing_queue,), daemon=True) # Pass socketio here
+    processing_thread = threading.Thread(target=process_transcripts, args=(processing_queue, 1), daemon=True) # Pass socketio here
     diarization_thread = threading.Thread(target=diarization_correction_thread, args=(processing_queue,), daemon=True) # Pass socketio here
 
     transcription_thread.start()

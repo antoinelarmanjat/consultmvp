@@ -1,10 +1,10 @@
 What is your current weight?
 What is your age?
 Do you smoke?
+Do you have any allergies?
+Are you taking any medications?
 What are your main symptoms today?
 How long have you had these symptoms?
-Are you taking any medications?
-Do you have any allergies?
 Do you have chestpain?
 Do you have shortness of breath?
 Do you have  swollen feet of hands?

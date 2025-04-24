@@ -38,6 +38,14 @@
             font-weight: bold;
             color: #1a73e8;
         }
+        .patient-title {
+            font-size: 1.4em;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #1a73e8;
+        }
         .patient-detail {
             margin-bottom: 10px;
             padding: 5px 0;
@@ -156,6 +164,7 @@
     <h1>Consultation Transcript</h1>
     <div class="container">
         <div id="patient-info">
+            <div class="patient-title">Patient at a Glance</div>
             <div class="patient-header">
                 <div class="patient-name">Loading patient...</div>
                 <button class="switch-patient-btn" onclick="loadRandomPatient()">Switch Patient</button>
