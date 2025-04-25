@@ -7,6 +7,7 @@ import os
 from threading import Lock
 import sqlite3
 from datetime import datetime
+import logging # Added logging
 
 # --- Vertex AI Imports ---
 import vertexai
@@ -21,39 +22,44 @@ from google.cloud import speech
 
 # --- Configuration ---
 SAMPLE_RATE = 16000
-CHUNK_SIZE = int(SAMPLE_RATE / 10)
+CHUNK_SIZE = int(SAMPLE_RATE / 10) # 100ms chunks
 LANGUAGE_CODE = "en-US"
-EXPECTED_SPEAKERS = 2
+EXPECTED_SPEAKERS = 2 # For diarization
 
 # --- Vertex AI Configuration ---
-LLM_MODEL_NAME = "gemini-2.0-flash-001" # Vertex AI model identifier
-DIARIZATION_LLM_MODEL_NAME = "gemini-2.5-pro-preview-03-25" # Use a different model for correction if needed
+LLM_MODEL_NAME = "gemini-2.0-flash-001"
+DIARIZATION_LLM_MODEL_NAME = "gemini-2.5-pro-preview-03-25"
 try:
     GCP_PROJECT_ID = os.environ['GOOGLE_CLOUD_PROJECT']
     GCP_LOCATION = os.environ['GOOGLE_CLOUD_LOCATION']
 except KeyError as e:
-    print(f"ERROR: Environment variable {e} not set.")
-    print("Please set GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION.")
+    logging.error(f"Environment variable {e} not set. Please set GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION.")
     sys.exit(1)
 
 # --- Global Variables & Queues ---
 audio_buffer = queue.Queue()
-processing_queue = queue.Queue()
-questions_list = []  # Global questions list
-questions_lock = threading.Lock()  # Lock for thread-safe access to questions_list
-questions_loaded = False  # Flag to track if questions have been loaded
-conversation_history = [] # Used by LLM processing
-conversation_lock = Lock() # New: Also store segments for initial client load, updated by process_transcripts
+processing_queue = queue.Queue() # For final transcripts to be processed by process_transcripts
+questions_list = []
+questions_lock = threading.Lock()
+questions_loaded = False
+conversation_history = []
+conversation_lock = Lock()
 transcript_segments = []
 transcript_lock = Lock()
 
-diarization_correction_history = [] # Store corrected versions
+diarization_correction_history = []
 diarization_correction_lock = Lock()
-segment_count = 0 # Count segments processed by process_transcripts
+segment_count = 0
 SEGMENTS_BEFORE_CORRECTION = 7
 
-# Pass the socketio instance globally or pass to functions that need it
-# Passing to functions is cleaner. Let's pass it to threads.
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(threadName)s - %(filename)s:%(lineno)d - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout) # Output logs to stdout
+    ]
+)
 
 def get_current_questions():
     """Returns a copy of the current questions list."""
@@ -70,8 +76,6 @@ def get_diarization_correction_history():
      with diarization_correction_lock:
          return diarization_correction_history.copy()
 
-
-# --- Helper Function to Load Questions (Unchanged) ---
 def load_questions(filename="questions.txt"):
     """Loads questions from a file into a list of dictionaries."""
     global questions_list, questions_loaded
@@ -85,47 +89,58 @@ def load_questions(filename="questions.txt"):
                         if line and not line.startswith('#'):
                             questions_list.append({
                                 'text': line,
-                                'status': 'pending', # 'pending', 'suggested', 'asked', 'answered'
+                                'status': 'pending',
                                 'answer': None,
-                                'general': len(questions_list) < 5  # First 5 questions are general
+                                'general': len(questions_list) < 5
                             })
                 questions_loaded = True
-                print(f"Loaded {len(questions_list)} questions from {filename}")
-                print("Loaded questions:")
+                logging.info(f"Loaded {len(questions_list)} questions from {filename}")
                 for q in questions_list:
-                    print(f"  - {q['text']} (status: {q['status']}, general: {q['general']})")
+                    logging.debug(f"  - {q['text']} (status: {q['status']}, general: {q['general']})")
                 return questions_list
             except FileNotFoundError:
-                print(f"ERROR: {filename} not found. Please create it.")
+                logging.error(f"{filename} not found. Please create it.")
                 return []
         else:
-            print("Questions already loaded, returning existing list")
+            logging.info("Questions already loaded, returning existing list")
             return questions_list
 
-
-# --- Audio Recording Callback (Unchanged) ---
+# --- Audio Recording Callback (MODIFIED for better status reporting) ---
 def audio_callback(indata, frames, time_info, status):
+    """This is called (from a separate thread) for each audio block."""
     if status:
-        a=1
+        # More descriptive logging for audio issues
+        logging.warning(f"[Audio Callback] Status flags: {status} - {sd.CallbackFlags(status)}")
+        if status & sd.CallbackFlags.INPUT_UNDERFLOW:
+            logging.warning("[Audio Callback] Input underflow: not enough data from the audio interface.")
+        if status & sd.CallbackFlags.INPUT_OVERFLOW:
+            logging.warning("[Audio Callback] Input overflow: data from the audio interface was lost.")
+        # You might add more specific handling or counters for these issues if needed
     audio_buffer.put(bytes(indata))
 
 # --- Generator for Audio Stream to API (Unchanged) ---
 def audio_generator():
+    """Yields audio chunks from the buffer to the Speech API.
+    This is a generator function that blocks until data is available.
+    """
+    logging.info("[Audio Generator] Starting...")
     while True:
-        chunk = audio_buffer.get()
+        chunk = audio_buffer.get() # Blocks here until audio data is available
         if chunk is None:
+            logging.info("[Audio Generator] Received None, stopping.")
             break
         yield speech.StreamingRecognizeRequest(audio_content=chunk)
+    logging.info("[Audio Generator] Stopped.")
 
-# --- Speech-to-Text Thread Function (MODIFIED to emit new_transcript) ---
-# Now accepts socketio instance to emit directly
-# --- Speech-to-Text Thread Function (MODIFIED for extensive logging) ---
-# Now accepts socketio instance to emit directly
-def run_transcription(processing_queue):
+
+# --- Speech-to-Text Thread Function (IMPROVED) ---
+def run_transcription(processing_queue_ref): # Renamed arg to avoid conflict with global
+    """
+    Continuously captures audio, sends it to Google Cloud Speech-to-Text,
+    formats the final diarized transcript, and puts it on the processing_queue.
+    """
     client = speech.SpeechClient()
 
-    # --- Configuration ---
-    # Keep your original config for now, but be ready to simplify if needed
     diarization_config = speech.SpeakerDiarizationConfig(
         enable_speaker_diarization=True,
         min_speaker_count=EXPECTED_SPEAKERS,
@@ -137,134 +152,148 @@ def run_transcription(processing_queue):
         language_code=LANGUAGE_CODE,
         enable_automatic_punctuation=True,
         diarization_config=diarization_config,
-        enable_word_confidence=True, # Keep this, it helps inspect word details
+        enable_word_confidence=True, # Useful for debugging, little overhead
+        # model="telephony", # Example: consider if your audio is phone-like
+        # use_enhanced=True, # For certain models
     )
     streaming_config = speech.StreamingRecognitionConfig(
         config=recognition_config,
         interim_results=True,
     )
-    print("\n[Transcription Thread] Starting Google Cloud Speech-to-Text stream...")
-    requests = audio_generator()
+
+    logging.info("Starting Google Cloud Speech-to-Text stream...")
+    audio_requests = audio_generator() # Get the generator
     stream_ended_normally = False
+    last_interim_output_time = time.time()
 
     try:
         responses = client.streaming_recognize(
             config=streaming_config,
-            requests=requests,
+            requests=audio_requests,
         )
-        #print("[Transcription Thread] Receiving responses from Google API...")
 
-        # --- Log each response received ---
-        # Iterate through responses. This loop blocks until a response is available.
-        for i, response in enumerate(responses):
-            # Use sys.stdout.flush() to ensure prints appear immediately,
-            # especially with the '\r' from the interim print.
-            sys.stdout.flush()
+        logging.info("Receiving responses from Google API...")
+        for response_idx, response in enumerate(responses):
+            if response.error and response.error.message:
+                logging.error(f"Google Speech API Error: {response.error.message} (Code: {response.error.code})")
+                # Depending on the error code, you might want to break or attempt to restart.
+                # For simplicity, we'll break here.
+                # See https://cloud.google.com/apis/design/errors#error_codes for codes
+                if response.error.code == 11: # DEADLINE_EXCEEDED for streaming
+                     logging.warning("Deadline exceeded, may indicate silence or network issues. Stream might close.")
+                # Some errors might be terminal for the stream.
+                break # Stop processing this stream
 
             if not response.results:
-                #print("-> No results in response.")
+                logging.debug(f"Response {response_idx}: No results.")
                 continue
 
             result = response.results[0]
-            #print(f"-> is_final: {result.is_final}.", end=' ')
-            sys.stdout.flush()
-
             if not result.alternatives:
-                print("-> No alternatives in result.")
+                logging.debug(f"Response {response_idx}: No alternatives in result.")
                 continue
 
-            # Always print interim results for user feedback
-            if not result.is_final:
-                interim_transcript = result.alternatives[0].transcript
-                #print(f"Interim: {interim_transcript}", end='\r') # Use \r to overwrite line
+            transcript_alternative = result.alternatives[0]
+
+            if result.is_final:
+                # Clear any previous interim line
+                sys.stdout.write("\r" + " " * 80 + "\r") # Clear line
                 sys.stdout.flush()
-                continue # Go to the next response
+                logging.info(f"Final Segment {response_idx + 1} received (Stability: {result.stability:.2f}).")
 
-            # --- This block is ONLY reached if result.is_final is True ---
-            # Overwrite the interim line with the final segment info
-            #print(f"\n[Transcription Thread] Final Segment {i+1} received.")
-            sys.stdout.flush()
+                if not transcript_alternative.words:
+                    logging.warning("Final result has no words, skipping.")
+                    continue
 
-            final_alternative = result.alternatives[0]
-            if not final_alternative.words:
-                print("[Transcription Thread] Final result has no words.")
-                continue
+                diarized_segment = ""
+                current_speaker_tag = -1 # Initialize to a value that won't match first tag
 
-            # --- Diarization/Formatting (Only if diarization is enabled) ---
-            # Check if diarization was enabled in the config sent to Google
-            if hasattr(recognition_config, 'diarization_config') and recognition_config.diarization_config.enable_speaker_diarization:
-                 diarized_segment = ""
-                 current_speaker_tag = None
-                 #print("[Transcription Thread] Processing words with diarization tags:")
-                 for word_info in final_alternative.words:
-                     tag = word_info.speaker_tag if hasattr(word_info, 'speaker_tag') else 0 # Default to 0 if tag is missing for some reason
-                     word_text = word_info.word
+                if diarization_config.enable_speaker_diarization:
+                    for i, word_info in enumerate(transcript_alternative.words):
+                        # Google Speech API speaker_tag is usually an integer (1, 2, ...).
+                        # Tag 0 can sometimes mean "unknown" or "undetermined".
+                        speaker_tag_str = "UNKNOWN" # Default for missing or 0 tag
+                        if hasattr(word_info, 'speaker_tag') and word_info.speaker_tag != 0:
+                            speaker_tag_str = str(word_info.speaker_tag)
+                        elif hasattr(word_info, 'speaker_tag') and word_info.speaker_tag == 0 :
+                            # Explicitly handle tag 0 if it means something specific or keep as UNKNOWN
+                             speaker_tag_str = "UNKNOWN" # Or "SPEAKER_0" if you prefer
 
-                     if current_speaker_tag is None or tag != current_speaker_tag:
-                         if current_speaker_tag is not None:
-                            diarized_segment += "\n" # Add newline between speaker changes
-                         current_speaker_tag = tag
-                         diarized_segment += f"[Speaker {current_speaker_tag}]: {word_text}"
-                     else:
-                         diarized_segment += f" {word_text}"
-                 #print("[Transcription Thread] Finished processing words.")
+                        word_text = word_info.word
 
-            else:
-                 # If diarization is disabled, just get the raw transcript
-                 diarized_segment = final_alternative.transcript
-                 #print("[Transcription Thread] Diarization disabled, using raw transcript.")
+                        # Start of new speaker segment or first word
+                        if current_speaker_tag != speaker_tag_str:
+                            if diarized_segment: # Add newline if not the very first part of the segment
+                                diarized_segment += "\n"
+                            current_speaker_tag = speaker_tag_str
+                            diarized_segment += f"[Speaker {current_speaker_tag}]: {word_text}"
+                        else:
+                            diarized_segment += f" {word_text}"
+                else:
+                    diarized_segment = transcript_alternative.transcript
+                    logging.debug("Diarization disabled, using raw transcript for segment.")
 
-            # Print only the diarized final result
-            print("\n[Transcription Thread] --- FINAL DIARIZED SEGMENT ---")
-            print(diarized_segment)
-            print("------------------------------------")
+                logging.info(f"--- FINAL DIARIZED SEGMENT ---\n{diarized_segment}\n------------------------------------")
 
-            # --- Process and Emit the Final Segment ---
-            print(f"[DEBUG-EMIT] Attempting to put segment in processing queue...")
-            processing_queue.put(diarized_segment)
-            print("[DEBUG-EMIT] Segment put in queue.")
+                # Put the complete, final, diarized segment onto the queue for further processing
+                if diarized_segment: # Ensure we don't put empty strings
+                    logging.debug(f"Attempting to put final segment into processing queue...")
+                    processing_queue_ref.put(diarized_segment)
+                    logging.debug("Final segment put in processing queue.")
+                else:
+                    logging.warning("Empty diarized segment was not added to processing queue.")
 
-            #print("[Transcription Thread] Finished processing final segment.")
+            else: # Interim result
+                interim_transcript = transcript_alternative.transcript
+                # Limit interim output frequency to avoid flooding logs/console
+                current_time = time.time()
+                if current_time - last_interim_output_time > 0.5: # Log interim max every 0.5s
+                    # Use \r to overwrite the same line in the console for a live feel
+                    sys.stdout.write(f"\rInterim: {interim_transcript[:100]}...")
+                    sys.stdout.flush()
+                    last_interim_output_time = current_time
+                logging.debug(f"Interim transcript: {interim_transcript}")
 
 
-        # --- End of the 'for response in responses:' loop ---
-        # This line is only reached if the 'responses' iterator finishes without error (e.g., audio_generator yielded None)
+        # End of the 'for response in responses:' loop
+        # This is reached if the 'responses' iterator finishes (e.g., audio_generator yielded None)
         stream_ended_normally = True
-        #print("\n[Transcription Thread] 'responses' iterator finished.")
+        logging.info("'responses' iterator finished normally.")
 
+    except StopIteration:
+        # This can happen if the audio_generator() stops yielding (e.g. audio_buffer.put(None) was called)
+        stream_ended_normally = True
+        logging.info("Transcription stream stopped due to StopIteration (audio_generator likely finished).")
     except Exception as e:
-        # Catch any exception that occurs during the streaming or processing loop
-        #print(f"\n[Transcription Thread] !!! FATAL ERROR during transcription stream: {type(e).__name__}: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc() # Print the full traceback for debugging
+        logging.error(f"FATAL ERROR during transcription stream: {type(e).__name__}: {e}", exc_info=True)
+        # exc_info=True will print the full traceback
 
     finally:
-        # This block always runs when the try or except block finishes
-        #print(f"\n[Transcription Thread] Transcription stream thread stopping. Stream ended normally: {stream_ended_normally}.")
-        # Signal stop to processing threads. Putting None multiple times is safe.
-        #rint("[Transcription Thread] Signaling processing queue to stop.")
-        processing_queue.put(None) # Stop the processing thread
+        # Clear any lingering interim line
+        sys.stdout.write("\r" + " " * 80 + "\r")
+        sys.stdout.flush()
+        logging.info(f"Transcription stream thread stopping. Stream ended normally: {stream_ended_normally}.")
+        # Signal the processing thread that transcription is done by putting None in its queue.
+        logging.info("Signaling processing queue to stop.")
+        processing_queue_ref.put(None)
 
 
-# --- Transcript Processing Thread Function (MODIFIED to remove callback and emit question_update) ---
-# Now accepts socketio instance to emit question_update directly
-def process_transcripts(processing_queue, patient_id):
+# --- Transcript Processing Thread Function (Unchanged as per request) ---
+def process_transcripts(processing_queue_ref, patient_id):
     """Runs in a separate thread, processing segments, managing questions, and updating history."""
     global segment_count, conversation_history, transcript_segments
 
-    print("Processing thread started, loading questions...")
-    load_questions() # Load questions at the start
-    print("QUESTIONS LIST",questions_list)
+    logging.info("Processing thread started, loading questions...")
+    load_questions()
+    logging.debug(f"Initial QUESTIONS LIST in process_transcripts: {questions_list}")
 
-    # Initialize Vertex AI
     try:
-        print(f"Initializing Vertex AI for Project '{GCP_PROJECT_ID}' in Location '{GCP_LOCATION}'...")
+        logging.info(f"Initializing Vertex AI for Project '{GCP_PROJECT_ID}' in Location '{GCP_LOCATION}'...")
         vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION)
     except Exception as e:
-        print(f"ERROR: Failed to initialize Vertex AI: {e}")
+        logging.error(f"Failed to initialize Vertex AI: {e}", exc_info=True)
         return
 
-    # Load Vertex AI Model for questions
     safety_settings = {
         HarmCategory.HARM_CATEGORY_HARASSMENT: SafetySetting.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
         HarmCategory.HARM_CATEGORY_HATE_SPEECH: SafetySetting.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
@@ -273,22 +302,16 @@ def process_transcripts(processing_queue, patient_id):
     }
     try:
         model = GenerativeModel(LLM_MODEL_NAME)
-        print(f"Vertex AI model '{LLM_MODEL_NAME}' loaded for questions.")
+        logging.info(f"Vertex AI model '{LLM_MODEL_NAME}' loaded for questions.")
     except Exception as e:
-        print(f"ERROR: Could not load Vertex AI model '{LLM_MODEL_NAME}' for questions: {e}")
+        logging.error(f"Could not load Vertex AI model '{LLM_MODEL_NAME}' for questions: {e}", exc_info=True)
         return
 
-    # --- Initial Question Analysis (Moved from while loop) ---
-    print("\n" + "="*15 + " Initial General Questions " + "="*15)
-    
-    # Get patient info from database using the provided patient_id
+    logging.info("\n" + "="*15 + " Initial General Questions " + "="*15)
     patient_info = get_patient_info(patient_id)
     
     if patient_info:
-        print(f"Found patient info: {patient_info}")
-        print(f"FOUND QUESTIONS LIST: {questions_list}")
-        
-        # Create a prompt for the LLM to analyze which questions are already answered
+        logging.info(f"Found patient info: {patient_info}")
         db_info_prompt = f"""
         Here is the patient information from the database:
         {patient_info}
@@ -316,213 +339,196 @@ def process_transcripts(processing_queue, patient_id):
         
         Only include questions from the provided list. Do not add any other text or explanation.
         """
-        
         try:
             response = model.generate_content(db_info_prompt, safety_settings=safety_settings)
             analysis = response.text.strip()
-            print("ANALYSIS", analysis)
+            logging.debug(f"LLM DB Analysis Raw: {analysis}")
             
-            # Clean up the response by removing markdown code block markers
             if analysis.startswith('```json'):
-                analysis = analysis[7:]  # Remove ```json
+                analysis = analysis[7:]
             if analysis.endswith('```'):
-                analysis = analysis[:-3]  # Remove ```
-            analysis = analysis.strip()  # Remove any extra whitespace
+                analysis = analysis[:-3]
+            analysis = analysis.strip()
             
-            # Parse the JSON response
             import json
             try:
                 answers = json.loads(analysis)
-                
-                # Update questions based on the answers
-                for answer in answers:
-                    question_text = answer['question']
-                    answer_text = answer['answer']
-                    
-                    # Find and update the question in our list
-                    for question in questions_list:
-                        if question['text'] == question_text and question['status'] == 'pending':
-                            if answer_text != "needs to be asked":
-                                question['status'] = 'answered'
-                                question['answer'] = answer_text
-                                print(f"Question already answered from database: {question_text}")
-                                print(f"Answer: {answer_text}")
-                            else:
-                                question['status'] = 'suggested'
-                                print(f"Question needs to be asked: {question_text}")
-                            break
-            
+                for answer_obj in answers: # Renamed to avoid conflict
+                    question_text = answer_obj['question']
+                    answer_text = answer_obj['answer']
+                    with questions_lock:
+                        for question in questions_list:
+                            if question['text'] == question_text and question['status'] == 'pending':
+                                if answer_text != "needs to be asked":
+                                    question['status'] = 'answered'
+                                    question['answer'] = answer_text
+                                    logging.info(f"Question already answered from database: {question_text} -> Answer: {answer_text}")
+                                else:
+                                    question['status'] = 'suggested'
+                                    logging.info(f"Question needs to be asked (from DB check): {question_text}")
+                                break
             except json.JSONDecodeError as e:
-                print(f"Error parsing LLM response as JSON: {e}")
-                print(f"Raw response after cleanup: {analysis}")
-                # Fallback to suggesting all questions if JSON parsing fails
+                logging.error(f"Error parsing LLM DB analysis JSON: {e}. Raw response: {analysis}", exc_info=True)
+                with questions_lock:
+                    for question in questions_list:
+                        if question['general'] and question['status'] == 'pending':
+                            question['status'] = 'suggested'
+        except Exception as e:
+            logging.error(f"Error analyzing database info with LLM: {e}", exc_info=True)
+            with questions_lock:
                 for question in questions_list:
                     if question['general'] and question['status'] == 'pending':
                         question['status'] = 'suggested'
-        
-        except Exception as e:
-            print(f"Error analyzing database info with LLM: {e}")
-            # Fallback to suggesting all questions if LLM analysis fails
+    else:
+        logging.info("No patient info found in database, suggesting all general questions.")
+        with questions_lock:
             for question in questions_list:
                 if question['general'] and question['status'] == 'pending':
                     question['status'] = 'suggested'
-    else:
-        print("No patient info found in database, suggesting all general questions")
-        # If no patient info, suggest all general questions
-        for question in questions_list:
-            if question['general'] and question['status'] == 'pending':
-                question['status'] = 'suggested'
     
-    print("="*51 + "\n")
+    logging.info("="*51 + "\n")
     initial_suggestions_done = True
 
-    # --- Main Processing Loop ---
     while True:
-        segment = processing_queue.get()
+        segment = processing_queue_ref.get() # Use the reference
 
         if segment is None:
-            print("Processing thread received stop signal.")
+            logging.info("Processing thread received stop signal.")
             break
 
-        print(f"\n[Processor] Processing Segment:\n{segment}\n-----------------------------")
+        logging.info(f"\n[Processor] Processing Segment:\n{segment}\n-----------------------------")
 
-        # Update conversation history
         with conversation_lock:
             conversation_history.append(segment)
             segment_count += 1
+            logging.debug(f"Segment count updated to: {segment_count}")
 
-        # Update transcript segments
+
         with transcript_lock:
             transcript_segments.append(segment)
 
-        # --- 2. Check for Answers (Unchanged logic, emit question_update after) ---
-        # Process this segment to see if it answers any *currently suggested* questions
         updated_questions_during_segment_processing = False
-        print("QUESTIONS TO CHECK",questions_list)
         with questions_lock:
-            # Check questions that are 'suggested'
             questions_to_check = [q for q in questions_list if q['status'] == 'suggested']
-            for question in questions_to_check:
-                # Use the full context for answer checking (can optimize later if needed)
-                full_context = "\n".join(conversation_history)
-                prompt = f"""
-                This is a conversation transcript:
-                ---
-                {full_context}
-                ---
-                Has the question "{question['text']}" been answered or addressed in the MOST RECENT part of the conversation, or earlier?
-                Dont pay any attention to the diarization because it does not work, try to figure out the answers without
-                taking care of the Speaker indications.
-                Respond in one of two ways EXACTLY:
-                1. If YES (or likely), respond with: YES - [The specific answer extracted from the conversation]
-                2. If NO, respond with: NO
-                """
-                try:
-                    response = model.generate_content(prompt, safety_settings=safety_settings)
-                    llm_answer = response.text.strip()
-                    # print(f"Answer check for question '{question['text']}': {llm_answer}") # Optional debug print
+        
+        logging.debug(f"Questions to check for answers: {[q['text'] for q in questions_to_check]}")
 
-                    if llm_answer.startswith("YES -"):
-                        extracted_answer = llm_answer[len("YES -"):].strip()
-                        # Only update if status changes or answer is new/different
-                        if question['status'] != 'answered' or question['answer'] != extracted_answer:
-                            question['status'] = 'answered'
-                            question['answer'] = extracted_answer
-                            updated_questions_during_segment_processing = True
-                            print("="*40)
-                            print(f"[System Found Answer]")
-                            print(f"  Q: {question['text']}")
-                            print(f"  A: {extracted_answer}")
-                            print("="*40 + "\n")
-                            # print(f"Updated question: {question['text']} (status: {question['status']}, answer: {question['answer']})") # Optional debug print
+        for question in questions_to_check: # Iterate on a copy or re-fetch if modification happens inside
+            full_context = "\n".join(conversation_history) # Use current conversation history
+            prompt = f"""
+            This is a conversation transcript:
+            ---
+            {full_context}
+            ---
+            Has the question "{question['text']}" been answered or addressed in the MOST RECENT part of the conversation, or earlier?
+            Dont pay any attention to the diarization because it does not work, try to figure out the answers without
+            taking care of the Speaker indications.
+            Respond in one of two ways EXACTLY:
+            1. If YES (or likely), respond with: YES - [The specific answer extracted from the conversation]
+            2. If NO, respond with: NO
+            """
+            try:
+                response = model.generate_content(prompt, safety_settings=safety_settings)
+                llm_answer = response.text.strip()
+                logging.debug(f"LLM Answer check for Q '{question['text']}': {llm_answer}")
 
-                except Exception as e:
-                    print(f"[Processor] ERROR during Vertex AI API call for answer check '{question['text']}': {e}")
+                if llm_answer.startswith("YES -"):
+                    extracted_answer = llm_answer[len("YES -"):].strip()
+                    with questions_lock: # Lock before modifying shared questions_list
+                        # Re-find the question in the main list to ensure its current state
+                        for q_main in questions_list:
+                            if q_main['text'] == question['text']:
+                                if q_main['status'] != 'answered' or q_main['answer'] != extracted_answer:
+                                    q_main['status'] = 'answered'
+                                    q_main['answer'] = extracted_answer
+                                    updated_questions_during_segment_processing = True
+                                    logging.info("="*40)
+                                    logging.info(f"[System Found Answer]")
+                                    logging.info(f"  Q: {q_main['text']}")
+                                    logging.info(f"  A: {extracted_answer}")
+                                    logging.info("="*40 + "\n")
+                                break
+            except Exception as e:
+                logging.error(f"[Processor] ERROR during Vertex AI API call for answer check '{question['text']}': {e}", exc_info=True)
 
-        # --- 3. Ongoing Contextual Question Suggestions (Unchanged logic, emit question_update after) ---
-        # Suggest new questions based on the full context
         updated_suggestions_during_segment_processing = False
-        if initial_suggestions_done: # Ensure initial ones are handled first
+        if initial_suggestions_done:
             with questions_lock:
-                # Only suggest from 'pending' contextual questions
                 pending_contextual_questions = [
                     q for q in questions_list if not q['general'] and q['status'] == 'pending'
                 ]
-                if pending_contextual_questions:
-                    full_context = "\n".join(conversation_history)
-                    candidate_question_texts = [q['text'] for q in pending_contextual_questions]
-                    # Using the same prompt, potentially optimize context length later
-                    suggestion_prompt = f"""You are an assistant helping a doctor during a patient consultation.
-                    Analyze the following ongoing conversation transcript:
-                    --- CONVERSATION START ---
-                    {full_context}
-                    --- CONVERSATION END ---
+            
+            if pending_contextual_questions:
+                full_context = "\n".join(conversation_history)
+                candidate_question_texts = [q['text'] for q in pending_contextual_questions]
+                suggestion_prompt = f"""You are an assistant helping a doctor during a patient consultation.
+                Analyze the following ongoing conversation transcript:
+                --- CONVERSATION START ---
+                {full_context}
+                --- CONVERSATION END ---
 
-                    Here is a list of potential follow-up questions that have NOT YET been asked or answered:
-                    --- AVAILABLE QUESTIONS ---
-                    {chr(10).join(f'- {q}' for q in candidate_question_texts)}
-                    --- END AVAILABLE QUESTIONS ---
-                    Don't take into account the diarization because it might be completely off and incorrect.
-                    Try to find the answer without the speaker indications (maybe wrong speakers)
-                    Based on the flow and content of the conversation, identify ALL questions from the list above that have become relevant and appropriate for the doctor to ask NEXT.
+                Here is a list of potential follow-up questions that have NOT YET been asked or answered:
+                --- AVAILABLE QUESTIONS ---
+                {chr(10).join(f'- {q}' for q in candidate_question_texts)}
+                --- END AVAILABLE QUESTIONS ---
+                Don't take into account the diarization because it might be completely off and incorrect.
+                Try to find the answer without the speaker indications (maybe wrong speakers)
+                Based on the flow and content of the conversation, identify ALL questions from the list above that have become relevant and appropriate for the doctor to ask NEXT.
 
-                    Consider:
-                    1. The patient's current symptoms or complaints
-                    2. Any medical history mentioned
-                    3. The natural flow of a medical consultation
-                    4. Questions that would help clarify the patient's condition
+                Consider:
+                1. The patient's current symptoms or complaints
+                2. Any medical history mentioned
+                3. The natural flow of a medical consultation
+                4. Questions that would help clarify the patient's condition
 
-                    List EACH relevant question's exact text on a new line.
-                    If NONE of the available questions seem particularly relevant to ask right now based on the latest developments, respond ONLY with the word "NONE". Do not add any other text or explanation.
-                    """
-                    try:
-                        response = model.generate_content(suggestion_prompt, safety_settings=safety_settings)
-                        suggested_lines = response.text.strip().splitlines()
-                        # print(f"Suggested questions from Gemini: {suggested_lines}") # Optional debug print
+                List EACH relevant question's exact text on a new line.
+                If NONE of the available questions seem particularly relevant to ask right now based on the latest developments, respond ONLY with the word "NONE". Do not add any other text or explanation.
+                """
+                try:
+                    response = model.generate_content(suggestion_prompt, safety_settings=safety_settings)
+                    suggested_lines = response.text.strip().splitlines()
+                    logging.debug(f"LLM Suggested contextual questions: {suggested_lines}")
 
-                        if suggested_lines and suggested_lines[0].strip().lower() != "none":
-                            print("\n[System Suggests Asking (Contextual)]:")
-                            for suggested_text in suggested_lines:
-                                suggested_text = suggested_text.strip()
-                                if not suggested_text: continue
+                    if suggested_lines and suggested_lines[0].strip().lower() != "none":
+                        logging.info("\n[System Suggests Asking (Contextual)]:")
+                        for suggested_text in suggested_lines:
+                            suggested_text = suggested_text.strip()
+                            if not suggested_text: continue
+                            with questions_lock: # Lock before modifying shared questions_list
+                                for question_obj in pending_contextual_questions: # Iterate over the local copy for comparison
+                                     # Re-find in main list to update actual object
+                                    for q_main in questions_list:
+                                        if q_main['text'] == question_obj['text']:
+                                            if (q_main['text'].strip().lower() == suggested_text.lower() or \
+                                                suggested_text.lower() in q_main['text'].strip().lower()) and \
+                                               q_main['status'] == 'pending': # Double check status
+                                                logging.info(f"  - {q_main['text']}")
+                                                q_main['status'] = 'suggested'
+                                                updated_suggestions_during_segment_processing = True
+                                            break # Found the question in main list
+                                    
+                except Exception as e:
+                    logging.error(f"[Processor] ERROR during Vertex AI API call for question suggestion: {e}", exc_info=True)
 
-                                # Find the question in our list and update its status
-                                for question in pending_contextual_questions:
-                                    # Use a robust check (lower case, possibly fuzzy match if needed)
-                                    if question['text'].strip().lower() == suggested_text.lower() or suggested_text.lower() in question['text'].strip().lower():
-                                        if question['status'] == 'pending':
-                                            print(f"  - {question['text']}")
-                                            question['status'] = 'suggested'
-                                            updated_suggestions_during_segment_processing = True
-                                            # print(f"Updated question: {question['text']} (status: {question['status']})") # Optional debug print
-                                        break # Found the match, move to next suggested_text
-
-                    except Exception as e:
-                        print(f"[Processor] ERROR during Vertex AI API call for question suggestion: {e}")
-                # else:
-                #      print("[Processor]: No pending contextual questions to suggest.") # Optional debug print
-
-    # Final status print (unchanged)
-    print("\n--- Final Question Status ---")
+    logging.info("\n--- Final Question Status ---")
     with questions_lock:
         for q in questions_list:
-            print(f"Q: {q['text']}")
-            print(f"  Status: {q['status']}")
+            logging.info(f"Q: {q['text']}")
+            logging.info(f"  Status: {q['status']}")
             if q['answer']:
-                print(f"  Answer: {q['answer']}")
-    print("---------------------------\n")
-    print("Processing thread finished.")
+                logging.info(f"  Answer: {q['answer']}")
+    logging.info("---------------------------\n")
+    logging.info("Processing thread finished.")
 
 
-# --- Diarization Correction Helper (MODIFIED to use passed socketio_instance) ---
+# --- Diarization Correction Helper (Unchanged) ---
 def send_to_gemini_for_diarization(conversation_text):
     """Send conversation to Gemini for diarization correction."""
     try:
-        # Load Vertex AI Model for correction if not already loaded or use a different one
-        # Note: Re-initializing/loading model per call is inefficient, but kept for simplicity
-        # If performance is critical, load this model once in the thread setup.
-        vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION)
-        model = GenerativeModel(DIARIZATION_LLM_MODEL_NAME) # Use the specific diarization model name
+        # Consider initializing model once if this function is called frequently by the same thread.
+        # For now, keeping original behavior.
+        vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION) #Potentially re-init
+        model = GenerativeModel(DIARIZATION_LLM_MODEL_NAME)
         prompt = f"""
         The diarization of Google speech to text does not work very well. Here is a transcript of a conversation:
         {conversation_text}
@@ -531,87 +537,107 @@ def send_to_gemini_for_diarization(conversation_text):
         please review the conversation and try to fix the diarization by assigning the right speakers.
         Keep the same format with [Speaker X]: but make sure the speaker assignments are correct.
         """
-
-        print(f"Sending to Gemini for diarization correction (segments: {len(conversation_text.splitlines())})...")
+        logging.info(f"Sending to Gemini for diarization correction (approx lines: {len(conversation_text.splitlines())})...")
         response = model.generate_content(prompt)
-        print(f"Received correction from Gemini.") # Avoid printing full correction here, can be long
-        return response.text.strip()
+        corrected_text = response.text.strip()
+        logging.info(f"Received correction from Gemini. Length: {len(corrected_text)}")
+        return corrected_text
     except Exception as e:
-        print(f"Error in diarization correction: {e}")
+        logging.error(f"Error in diarization correction: {e}", exc_info=True)
         return None
 
-# --- Diarization Correction Thread Function (MODIFIED to pass socketio_instance to callback) ---
-# Accepts socketio instance
-def diarization_correction_thread(processing_queue):
+# --- Diarization Correction Thread Function (Unchanged, but added logging) ---
+# Note: processing_queue argument is unused here based on original code structure.
+def diarization_correction_thread(unused_processing_queue): # Explicitly mark as unused if not needed
     """Thread that periodically corrects diarization using Gemini."""
-    global segment_count
+    global segment_count # Uses global segment_count modified by process_transcripts
 
-    # Optional: Initialize the diarization model here if not doing it per call
-    # try:
-    #     vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION)
-    #     diarization_model = GenerativeModel(DIARIZATION_LLM_MODEL_NAME)
-    #     print(f"Vertex AI model '{DIARIZATION_LLM_MODEL_NAME}' loaded for diarization.")
-    # except Exception as e:
-    #     print(f"ERROR: Could not load Vertex AI model '{DIARIZATION_LLM_MODEL_NAME}' for diarization: {e}")
-    #     diarization_model = None # Handle case where model load fails
+    # Initialize the diarization model once per thread instance for efficiency
+    diarization_model_instance = None
+    try:
+        vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION) # Init once
+        diarization_model_instance = GenerativeModel(DIARIZATION_LLM_MODEL_NAME)
+        logging.info(f"Vertex AI model '{DIARIZATION_LLM_MODEL_NAME}' loaded for diarization correction thread.")
+    except Exception as e:
+        logging.error(f"Could not load Vertex AI model '{DIARIZATION_LLM_MODEL_NAME}' for diarization thread: {e}", exc_info=True)
+        # If the model fails to load, this thread won't be able to perform corrections.
 
     while True:
-        time.sleep(1)  # Check every second
+        time.sleep(5) # Check periodically, adjust as needed. Original was 1s.
+
+        if not diarization_model_instance:
+            logging.warning("Diarization correction model not loaded, skipping correction cycle.")
+            continue # Wait and try to re-initialize or simply skip if fatal
+
+        perform_correction = False
+        current_conversation_snapshot = "" # To hold the snapshot
 
         with conversation_lock:
-            # Only trigger if we have processed enough new segments AND there's history
+            # Check if enough new segments have been processed
             if segment_count >= SEGMENTS_BEFORE_CORRECTION and conversation_history:
-                # Get current conversation
-                current_conversation = "\n".join(conversation_history)
-                print(f"Triggering diarization correction after {segment_count} new segments.")
+                # Take a snapshot of the current conversation history for correction
+                current_conversation_snapshot = "\n".join(conversation_history)
+                logging.info(f"Triggering diarization correction. Segments processed since last: {segment_count}. Total history length approx: {len(current_conversation_snapshot)} chars.")
+                segment_count = 0 # Reset counter immediately after deciding to correct
+                perform_correction = True
 
-                # Reset counter BEFORE the potentially long LLM call
-                segment_count = 0
+        if perform_correction and current_conversation_snapshot:
+            # Call LLM with the model instance (avoids re-init of vertexai and model loading)
+            prompt = f"""
+            The diarization of Google speech to text does not work very well. Here is a transcript of a conversation:
+            {current_conversation_snapshot}
 
-                # Call the LLM to get corrected version
-                # Pass only the conversation text here, LLM logic is inside the helper
-                corrected_version = send_to_gemini_for_diarization(current_conversation)
+            Based on the conversation above, where the speakers and the conversation diarization in the dialogue are not very good,
+            please review the conversation and try to fix the diarization by assigning the right speakers.
+            Keep the same format with [Speaker X]: but make sure the speaker assignments are correct. Example: [Speaker 1]: Hello.
+            """
+            try:
+                logging.info(f"Sending to Gemini for diarization correction (snapshot lines: {len(current_conversation_snapshot.splitlines())})...")
+                gemini_response = diarization_model_instance.generate_content(prompt)
+                corrected_version = gemini_response.text.strip()
+                logging.info(f"Received correction from Gemini. Corrected length: {len(corrected_version)}")
 
                 if corrected_version:
                     with diarization_correction_lock:
-                        # Store the corrected version along with the original it was based on
                         diarization_correction_history.append({
-                            'original': current_conversation,
-                            'corrected': corrected_version
+                            'original_snapshot_length': len(current_conversation_snapshot), # Storing length for reference
+                            'corrected': corrected_version,
+                            'timestamp': time.time()
                         })
-                        print(f"Stored corrected version {diarization_correction_history}.")
+                        # Keep history from getting too large if needed
+                        # max_history_items = 10
+                        # if len(diarization_correction_history) > max_history_items:
+                        # diarization_correction_history = diarization_correction_history[-max_history_items:]
+                        logging.info(f"Stored corrected version. Total corrections in history: {len(diarization_correction_history)}")
+                        logging.debug(f"Last corrected version: \n{corrected_version[:500]}...") # Log a snippet
 
-                    # Call the callback to update the web interface, passing socketio_instance
-                    """
-                    callback({
-                        'original': current_conversation,
-                        'corrected': corrected_version
-                    }, socketio_instance) # Pass socketio instance to the callback
-                    """
-# --- Callback for Diarization Correction (MODIFIED to accept socketio) ---
-# Moved this handler function here as it's tightly coupled with the correction thread logic.
-# It needs the socketio instance to emit.
+                    # If using SocketIO, this is where you'd emit the 'diarization_correction' event
+                    # Example:
+                    # if socketio_instance:
+                    #     socketio_instance.emit('diarization_correction', {'corrected': corrected_version})
+
+            except Exception as e:
+                logging.error(f"Error during diarization correction LLM call: {e}", exc_info=True)
+        # No else needed, if not performing_correction, just loops and sleeps.
+
+
+# --- Callback for Diarization Correction (Unchanged, assumed for SocketIO context) ---
 def handle_diarization_correction(data, socketio_instance):
     """Handles the corrected diarization data and emits to the client."""
     try:
-        # We already stored the history in the correction thread, just emit the latest
-        print(f"Emitting diarization_correction event.")
-        """
-        try:
-             socketio_instance.emit('diarization_correction', {
-                 'original': data['original'],
-                 'corrected': data['corrected']
-             })
-        except Exception as e:
-             print(f"Error emitting diarization_correction: {e}", file=sys.stderr)
-        """
+        logging.info(f"Emitting diarization_correction event via SocketIO.")
+        # socketio_instance.emit('diarization_correction', {
+        #     'original': data.get('original'), # Or snapshot reference
+        #     'corrected': data['corrected']
+        # })
     except Exception as e:
-        print(f"Error handling diarization correction callback: {e}", file=sys.stderr)
+        logging.error(f"Error handling diarization correction callback for emit: {e}", exc_info=True)
 
+# --- Get Patient Info (Unchanged, added logging) ---
 def get_patient_info(patient_id):
     """Get patient information from the database."""
     try:
-        conn = sqlite3.connect('patients.db')
+        conn = sqlite3.connect('patients.db') # Ensure this path is correct
         cursor = conn.cursor()
         cursor.execute('''
             SELECT first_name, last_name, date_of_birth, weight, allergies, smokes, medications, last_visit_reason, last_visit_date
@@ -622,12 +648,14 @@ def get_patient_info(patient_id):
         conn.close()
         
         if patient:
-            # Calculate age if birthdate is present
             age = None
-            if patient[2]:  # date_of_birth
-                birthdate = datetime.strptime(patient[2], '%Y-%m-%d')
-                today = datetime.now()
-                age = today.year - birthdate.year - ((today.month, today.day) < (birthdate.month, birthdate.day))
+            if patient[2]:
+                try:
+                    birthdate = datetime.strptime(patient[2], '%Y-%m-%d')
+                    today = datetime.now()
+                    age = today.year - birthdate.year - ((today.month, today.day) < (birthdate.month, birthdate.day))
+                except ValueError:
+                    logging.warning(f"Could not parse date_of_birth: {patient[2]}")
             
             return {
                 'first_name': patient[0],
@@ -643,81 +671,106 @@ def get_patient_info(patient_id):
             }
         return None
     except Exception as e:
-        print(f"Error getting patient info: {e}")
+        logging.error(f"Error getting patient info: {e}", exc_info=True)
         return None
 
-# --- Main Execution Block (Adjusted for passing socketio if run standalone) ---
-# Note: This __main__ block is typically not used when run via app.py,
-# but kept for completeness if you wanted to test audio.py directly (without Flask/SocketIO)
+# --- Main Execution Block (Adjusted for new logging) ---
 if __name__ == "__main__":
-    print("Starting audio processing application with Diarization and Vertex AI LLM Monitoring (Standalone Mode)...")
-    print("Note: SocketIO emissions will not work in this mode.")
+    logging.info("Starting audio processing application (Standalone Mode)...")
+    # Note: SocketIO emissions will not work directly in this mode
+    # unless a dummy or actual SocketIO server is integrated here.
 
-    """# Create dummy socketio instance if running standalone, to avoid errors
-    class DummySocketIO:
-        def emit(self, event, data):
-            print(f"[DummySocketIO] Emitted event '{event}' with data (truncated): {str(data)[:100]}...")
-        def start_background_task(self, target, *args, **kwargs):
-             # In standalone, just run the task directly or in a simple thread
-             print(f"[DummySocketIO] Starting background task: {target.__name__}")
-             thread = threading.Thread(target=target, args=args, kwargs=kwargs)
-             thread.daemon = True
-             thread.start()
-             return thread
+    # Queues are already global
+    # processing_queue = queue.Queue() # This is already global
 
-    dummy_socketio = DummySocketIO()
-"""
-    # --- Start Threads ---
-    processing_queue = queue.Queue()
-    # Pass dummy_socketio to threads
-    transcription_thread = threading.Thread(target=run_transcription, args=(processing_queue,), daemon=True)
-    processing_thread = threading.Thread(target=process_transcripts, args=(processing_queue, 1), daemon=True) # Pass socketio here
-    diarization_thread = threading.Thread(target=diarization_correction_thread, args=(processing_queue,), daemon=True) # Pass socketio here
+    # Start Threads
+    # Pass the global processing_queue to the threads
+    transcription_thread = threading.Thread(
+        target=run_transcription, args=(processing_queue,), daemon=True, name="TranscriptionThread"
+    )
+    processing_thread = threading.Thread(
+        target=process_transcripts,
+        args=(processing_queue, current_patient_id),  # Pass both queue and patient_id
+        daemon=True
+    )
+    # The diarization_correction_thread's processing_queue argument was unused, so passing it is optional
+    # or it can be removed from its definition if truly not needed by its logic.
+    # For now, keeping it as `unused_processing_queue` in its definition.
+    diarization_thread = threading.Thread(
+        target=diarization_correction_thread, args=(processing_queue,), daemon=True, name="DiarizationCorrectionThread"
+    )
 
     transcription_thread.start()
     processing_thread.start()
     diarization_thread.start()
 
-    # --- Start Recording Audio ---
     stream = None
     try:
+        # Check available devices if needed: print(sd.query_devices())
+        # You might want to specify a device index: device=sd.default.device[0] or specific device index
         stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
-            blocksize=CHUNK_SIZE,
+            blocksize=CHUNK_SIZE, # This is frames per callback
             channels=1,
             dtype='int16',
             callback=audio_callback
         )
         stream.start()
-        print("Recording started. Press Ctrl+C to stop.")
+        logging.info(f"Recording started from device: {stream.device} with samplerate: {stream.samplerate} Hz. Press Ctrl+C to stop.")
 
-        # Keep main thread alive
         while transcription_thread.is_alive() or processing_thread.is_alive() or diarization_thread.is_alive():
-            time.sleep(0.1)
+            time.sleep(0.5) # Main thread sleep, threads are active
 
     except KeyboardInterrupt:
-        print("\nCtrl+C received. Stopping recording and processing...")
-        audio_buffer.put(None) # Signal audio generator to stop
-        processing_queue.put(None) # Signal processing thread to stop
+        logging.info("\nCtrl+C received. Initiating shutdown...")
+        # Signal audio generator to stop, which will end the transcription stream
+        audio_buffer.put(None)
+        # The transcription thread's finally block will put None into processing_queue
+        # to signal the processing_thread. If process_transcripts could be blocked on
+        # something else, an additional signal might be needed.
 
     except Exception as e:
-        print(f"\nAn unexpected error occurred in the main loop: {e}")
-        # Ensure stop signals are sent even on error
-        if audio_buffer.empty(): audio_buffer.put(None)
-        if processing_queue.empty(): processing_queue.put(None)
+        logging.critical(f"An unexpected error occurred in the main loop: {e}", exc_info=True)
+        # Ensure stop signals are sent even on unexpected error
+        if audio_buffer.empty() or not (audio_buffer.queue and audio_buffer.queue[-1] is None): # Avoid multiple Nones if already sent
+             audio_buffer.put(None)
+        # The transcription_thread's finally clause should handle its queue,
+        # but if it died before that, processing_queue might need a None.
+        # However, this is tricky as the processing_queue is managed by transcription_thread's lifecycle.
 
     finally:
-        # Cleanup
         if stream and stream.active:
-             print("Stopping audio stream...")
+             logging.info("Stopping audio stream...")
              stream.stop()
              stream.close()
+             logging.info("Audio stream stopped and closed.")
 
-        print("Waiting for threads to finish...")
-        # Give threads a moment to shut down
-        transcription_thread.join(timeout=5)
-        processing_thread.join(timeout=5)
-        diarization_thread.join(timeout=5)
+        logging.info("Waiting for threads to finish...")
+        if transcription_thread.is_alive():
+            transcription_thread.join(timeout=10) # Increased timeout
+            if transcription_thread.is_alive():
+                logging.warning("Transcription thread did not finish in time.")
+        if processing_thread.is_alive():
+            # Ensure processing_queue has a None if transcription thread died unexpectedly before sending it
+            # This is a safeguard; ideally, run_transcription's finally block handles it.
+            # if not transcription_thread.is_alive() and (processing_queue.empty() or processing_queue.queue[-1] is not None):
+            #    logging.info("Transcription thread seems dead, ensuring processing_queue gets a None.")
+            #    processing_queue.put(None) # This might cause issues if transcription thread *also* puts None.
+                                         # Better to rely on the transcription_thread's finally.
+            processing_thread.join(timeout=10) # Increased timeout
+            if processing_thread.is_alive():
+                logging.warning("Processing thread did not finish in time.")
 
-        print("All threads finished.")
-        print("Application finished.")
+        # Diarization thread is a daemon, it will exit when non-daemon threads exit.
+        # However, joining it explicitly is cleaner if it has cleanup.
+        if diarization_thread.is_alive():
+            # Diarization thread might be sleeping or in a long LLM call.
+            # It doesn't have an explicit stop signal other than program termination.
+            # For graceful shutdown, you might add a global `shutdown_event` threading.Event()
+            # that it can check in its loop.
+            logging.info("Diarization thread is daemon; will exit with app. No explicit join or it might block shutdown.")
+            # diarization_thread.join(timeout=5) # Optionally join
+
+        logging.info("Application finished.")
+
+        

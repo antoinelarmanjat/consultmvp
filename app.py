@@ -33,13 +33,6 @@ current_patient_id = None
 # Create a queue for processing
 processing_queue = queue.Queue()
 
-# Start the audio processing threads
-transcription_thread = threading.Thread(target=run_transcription, args=(processing_queue,), daemon=True)
-processing_thread = threading.Thread(target=process_transcripts, args=(processing_queue,), daemon=True)
-
-transcription_thread.start()
-processing_thread.start()
-
 # --- Route for the main page (Unchanged) ---
 @app.route('/')
 def index():
@@ -49,14 +42,74 @@ def index():
 # --- Route to get the latest transcript data ---
 @app.route('/get_transcript')
 def get_transcript():
+    global current_patient_id
     segments = get_transcript_segments()
     questions = get_current_questions()
     corrections = get_diarization_correction_history()
+    
+    # Get current patient info
+    patient_info = None
+    if current_patient_id:
+        conn = sqlite3.connect('patients.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT first_name, last_name, date_of_birth, weight, 
+                   allergies, smokes, medications, last_visit_reason, last_visit_date
+            FROM patients 
+            WHERE id = ?
+        ''', (current_patient_id,))
+        patient = cursor.fetchone()
+        conn.close()
+        
+        if patient:
+            patient_info = {
+                'first_name': patient[0],
+                'last_name': patient[1],
+                'date_of_birth': patient[2],
+                'weight': patient[3],
+                'allergies': patient[4],
+                'smokes': patient[5],
+                'medications': patient[6],
+                'last_visit_reason': patient[7],
+                'last_visit_date': patient[8]
+            }
+    
     return jsonify({
         'segments': segments,
         'questions': questions,
-        'corrections': corrections
+        'corrections': corrections,
+        'patient': patient_info
     })
+
+# --- Route to get current patient data ---
+@app.route('/get_current_patient')
+def get_current_patient():
+    global current_patient_id
+    if current_patient_id:
+        conn = sqlite3.connect('patients.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT first_name, last_name, date_of_birth, weight, 
+                   allergies, smokes, medications, last_visit_reason, last_visit_date
+            FROM patients 
+            WHERE id = ?
+        ''', (current_patient_id,))
+        patient = cursor.fetchone()
+        conn.close()
+        
+        if patient:
+            return jsonify({
+                'first_name': patient[0],
+                'last_name': patient[1],
+                'date_of_birth': patient[2],
+                'weight': patient[3],
+                'allergies': patient[4],
+                'smokes': patient[5],
+                'medications': patient[6],
+                'last_visit_reason': patient[7],
+                'last_visit_date': patient[8]
+            })
+    return jsonify({'error': 'No patient selected'}), 404
 
 # --- Route to get random patient data ---
 @app.route('/get_random_patient')
@@ -101,8 +154,21 @@ def get_random_patient():
 # --- Function to start audio processing threads (MODIFIED for polling) ---
 def start_audio_processing():
     """Starts the transcription thread."""
+    global current_patient_id
     print("Starting audio processing threads (Polling Approach)...")
-    # Create a queue for communication between transcription and processing (still needed by transcription)
+    
+    # Ensure we have a patient ID
+    if current_patient_id is None:
+        # Get initial random patient ID if not set
+        conn = sqlite3.connect('patients.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM patients')
+        total_patients = cursor.fetchone()[0]
+        current_patient_id = random.randint(1, total_patients)
+        conn.close()
+        print(f"Selected initial patient ID: {current_patient_id}")
+
+    # Create a queue for communication between transcription and processing
     processing_queue = queue.Queue()
 
     # Start the transcription thread, passing the queue.
@@ -146,6 +212,7 @@ if __name__ == '__main__':
     total_patients = cursor.fetchone()[0]
     current_patient_id = random.randint(1, total_patients)
     conn.close()
+    print(f"Selected initial patient ID: {current_patient_id}")
 
     # Start only the transcription thread
     start_audio_processing()

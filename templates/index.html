@@ -188,42 +188,46 @@
             fetch('/get_random_patient')
                 .then(response => response.json())
                 .then(patient => {
-                    document.querySelector('.patient-name').textContent = 
-                        `${patient.first_name} ${patient.last_name}`;
-                    
-                    const details = document.getElementById('patient-details');
-                    details.innerHTML = `
-                        <div class="patient-detail">
-                            <div class="patient-label">Date of Birth</div>
-                            <div class="patient-value">${patient.date_of_birth || 'Not recorded'}</div>
-                        </div>
-                        <div class="patient-detail">
-                            <div class="patient-label">Weight</div>
-                            <div class="patient-value">${patient.weight ? patient.weight + ' kg' : 'Not recorded'}</div>
-                        </div>
-                        <div class="patient-detail">
-                            <div class="patient-label">Allergies</div>
-                            <div class="patient-value">${patient.allergies || 'Not recorded'}</div>
-                        </div>
-                        <div class="patient-detail">
-                            <div class="patient-label">Smoking Status</div>
-                            <div class="patient-value">${patient.smokes === null ? 'Not recorded' : (patient.smokes ? 'Smoker' : 'Non-smoker')}</div>
-                        </div>
-                        <div class="patient-detail">
-                            <div class="patient-label">Medications</div>
-                            <div class="patient-value">${patient.medications || 'Not recorded'}</div>
-                        </div>
-                        <div class="patient-detail">
-                            <div class="patient-label">Last Visit Reason</div>
-                            <div class="patient-value">${patient.last_visit_reason || 'Not recorded'}</div>
-                        </div>
-                        <div class="patient-detail">
-                            <div class="patient-label">Last Visit Date</div>
-                            <div class="patient-value">${patient.last_visit_date || 'Not recorded'}</div>
-                        </div>
-                    `;
+                    updatePatientDisplay(patient);
                 })
                 .catch(error => console.error('Error loading patient:', error));
+        }
+
+        function updatePatientDisplay(patient) {
+            document.querySelector('.patient-name').textContent = 
+                `${patient.first_name} ${patient.last_name}`;
+            
+            const details = document.getElementById('patient-details');
+            details.innerHTML = `
+                <div class="patient-detail">
+                    <div class="patient-label">Date of Birth</div>
+                    <div class="patient-value">${patient.date_of_birth || 'Not recorded'}</div>
+                </div>
+                <div class="patient-detail">
+                    <div class="patient-label">Weight</div>
+                    <div class="patient-value">${patient.weight ? patient.weight + ' kg' : 'Not recorded'}</div>
+                </div>
+                <div class="patient-detail">
+                    <div class="patient-label">Allergies</div>
+                    <div class="patient-value">${patient.allergies || 'Not recorded'}</div>
+                </div>
+                <div class="patient-detail">
+                    <div class="patient-label">Smoking Status</div>
+                    <div class="patient-value">${patient.smokes === null ? 'Not recorded' : (patient.smokes ? 'Smoker' : 'Non-smoker')}</div>
+                </div>
+                <div class="patient-detail">
+                    <div class="patient-label">Medications</div>
+                    <div class="patient-value">${patient.medications || 'Not recorded'}</div>
+                </div>
+                <div class="patient-detail">
+                    <div class="patient-label">Last Visit Reason</div>
+                    <div class="patient-value">${patient.last_visit_reason || 'Not recorded'}</div>
+                </div>
+                <div class="patient-detail">
+                    <div class="patient-label">Last Visit Date</div>
+                    <div class="patient-value">${patient.last_visit_date || 'Not recorded'}</div>
+                </div>
+            `;
         }
 
         function updateTranscript() {
@@ -240,6 +244,11 @@
                                 ${question.answer ? `<div class="answer-text">Answer: ${question.answer}</div>` : ''}
                             </div>
                         `).join('');
+                    }
+
+                    // Update patient info if available
+                    if (data.patient) {
+                        updatePatientDisplay(data.patient);
                     }
 
                     // Update corrections
@@ -275,7 +284,19 @@
         }
 
         // Load initial patient
-        loadRandomPatient();
+        fetch('/get_current_patient')
+            .then(response => response.json())
+            .then(patient => {
+                if (patient.error) {
+                    loadRandomPatient(); // If no patient is selected, load a random one
+                } else {
+                    updatePatientDisplay(patient);
+                }
+            })
+            .catch(error => {
+                console.error('Error loading current patient:', error);
+                loadRandomPatient(); // Fallback to random patient on error
+            });
 
         // Update every 2 seconds
         setInterval(updateTranscript, 2000);
