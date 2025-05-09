@@ -1,11 +1,11 @@
 What is your current weight?
-What is your age?
+What is your age or date of birth?
 Do you smoke?
 Do you have any allergies?
+What is the reason of your visit today?
 Are you taking any medications?
-What are your main symptoms today?
 How long have you had these symptoms?
-Do you have chestpain?
+Do you have chest pain?
 Do you have shortness of breath?
 Do you have  swollen feet of hands?
 Have you recently lost weight?

@@ -29,71 +29,71 @@ if __name__ == "__main__":
     dialogue_ssml = """
 <speak>
       <voice name="en-US-Wavenet-D">
-        <prosody rate="medium" duration="5s">
-          Good morning, Sophia. Thanks for coming in. What can I help you with today?
+        <prosody rate="medium">
+          Hello James, thanks for coming in. Please have a seat. What can I help you with today?
+          <break time="500ms"/>
         </prosody>
       </voice>
       <voice name="en-US-Wavenet-E">
-        <prosody rate="medium" duration="13s">
-          Morning, Doctor. I've been feeling quite weak and tired lately, and I've lost my appetite.
-        </prosody>
-      </voice>
-      <voice name="en-US-Wavenet-D">
-        <prosody rate="medium" duration="12s">
-          Weakness, tiredness, and loss of appetite. When did these symptoms begin? Have they come on suddenly or gradually?
-        </prosody>
-      </voice>
-      <voice name="en-US-Wavenet-E">
-        <prosody rate="medium" duration="15s">
-          It's been about two weeks now, starting gradually but getting worse. I just don't feel like eating much.
-        </prosody>
-      </voice>
-      <voice name="en-US-Wavenet-D">
-        <prosody rate="medium" duration="15s">
-          I see. Have you had any changes in your weight because of the reduced appetite? How is the weakness impacting your ability to do things around the house?
-        </prosody>
-      </voice>
-      <voice name="en-US-Wavenet-E">
-        <prosody rate="medium" duration="10s">
-          Yes, I think I've lost a little weight. The weakness makes me feel unsteady on my feet.
-        </prosody>
-      </voice>
-      <voice name="en-US-Wavenet-D">
-        <prosody rate="medium" duration="10s">
-          Thank you. You're taking Metoprolol – is that for blood pressure, and are you taking it regularly?
-        </prosody>
-      </voice>
-      <voice name="en-US-Wavenet-E">
-        <prosody rate="medium" duration="5s">
-          Yes, for blood pressure. I take it every day.
-        </prosody>
-      </voice>
-      <voice name="en-US-Wavenet-D">
-        <prosody rate="medium" duration="10s">
-          I need to update my records regarding smoking status. Have you ever smoked?
-        </prosody>
-      </voice>
-      <voice name="en-US-Wavenet-E">
-        <prosody rate="medium" duration="3s">
-          No, I've never smoked.
-        </prosody>
-      </voice>
-      <voice name="en-US-Wavenet-D">
-        <prosody rate="medium" duration="12s">
-          Okay. Have you experienced any other symptoms, like fever, nausea, or changes in your bowel movements?
-        </prosody>
-      </voice>
-      <voice name="en-US-Wavenet-E">
-        <prosody rate="medium" duration="5s">
-          No, just the weakness and no appetite.
+        <prosody rate="medium">
+          Hi Doctor. I've been having this weird feeling in my chest, like a fluttering or skipping beat sometimes. It's happening more often now and it's making me a bit worried.
+          <break time="1500ms"/>
         </prosody>
       </voice>
       <voice name="en-US-Wavenet-D">
         <prosody rate="medium">
-          Alright, these symptoms can be important, especially the unexplained weight loss. Let's do an exam and discuss further.
+          A fluttering or skipping feeling in your chest. I understand why that would be concerning. How often does this happen per day or week? Does it occur more at rest, when you're active, or is it random?
+          <break time="1500ms"/>
+        </prosody>
+      </voice>
+      <voice name="en-US-Wavenet-E">
+        <prosody rate="medium">
+          It's pretty random, maybe five or six times a day now. Sometimes when I'm just sitting around, other times when I'm walking.
+          <break time="1000ms"/>
+        </prosody>
+      </voice>
+      <voice name="en-US-Wavenet-D">
+        <prosody rate="medium">
+          Okay. Are you feeling short of breath when it happens, or dizzy at all? Do you get chest pain with it?
+          <break time="1000ms"/>
+        </prosody>
+      </voice>
+      <voice name="en-US-Wavenet-E">
+        <prosody rate="medium">
+          Not really short of breath, maybe a tiny bit lightheaded once or twice, but mostly just the weird feeling. No chest pain.
+          <break time="1000ms"/>
+        </prosody>
+      </voice>
+      <voice name="en-US-Wavenet-D">
+        <prosody rate="medium">
+          Thanks. You're still taking Omeprazole for stomach issues, correct? Are those symptoms well-controlled?
+          <break time="800ms"/>
+        </prosody>
+      </voice>
+      <voice name="en-US-Wavenet-E">
+        <prosody rate="medium">
+          Yes, still taking it. My stomach has been okay, it's just this new heart thing.
+          <break time="800ms"/>
+        </prosody>
+      </voice>
+      <voice name="en-US-Wavenet-D">
+        <prosody rate="medium">
+          Got it. And just for my records, do you know what your current weight is? We don't have it listed accurately from your last visit.
+          <break time="1000ms"/>
+        </prosody>
+      </voice>
+      <voice name="en-US-Wavenet-E">
+        <prosody rate="medium">
+          Uh, I'm not sure exactly, maybe around 85kg?
+          <break time="500ms"/>
+        </prosody>
+      </voice>
+      <voice name="en-US-Wavenet-D">
+        <prosody rate="medium">
+          Let's discuss these palpitations further and see what might be causing them.
         </prosody>
       </voice>
     </speak>
     """
-    output_file = "dialogue10.mp3"
+    output_file = "dialogue1.mp3"
     synthesize_ssml(dialogue_ssml, output_file)

@@ -50,7 +50,7 @@ transcript_lock = Lock()
 diarization_correction_history = []
 diarization_correction_lock = Lock()
 segment_count = 0
-SEGMENTS_BEFORE_CORRECTION = 7
+SEGMENTS_BEFORE_CORRECTION = 4
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -91,7 +91,7 @@ def load_questions(filename="questions.txt"):
                                 'text': line,
                                 'status': 'pending',
                                 'answer': None,
-                                'general': len(questions_list) < 5
+                                'general': len(questions_list) < 6
                             })
                 questions_loaded = True
                 logging.info(f"Loaded {len(questions_list)} questions from {filename}")
@@ -409,6 +409,7 @@ def process_transcripts(processing_queue_ref, patient_id):
 
         updated_questions_during_segment_processing = False
         with questions_lock:
+            #questions_to_check = [q for q in questions_list if q['status'] == 'suggested']
             questions_to_check = [q for q in questions_list if q['status'] == 'suggested']
         
         logging.debug(f"Questions to check for answers: {[q['text'] for q in questions_to_check]}")
@@ -416,13 +417,17 @@ def process_transcripts(processing_queue_ref, patient_id):
         for question in questions_to_check: # Iterate on a copy or re-fetch if modification happens inside
             full_context = "\n".join(conversation_history) # Use current conversation history
             prompt = f"""
-            This is a conversation transcript:
+            This is a conversation transcript of patient and a doctor. The conversation is difficult to follow
+            because the diarization is not very good. The goal is to extract the answer to questions that
+            are asked by the doctor during the consultation, but that are difficult to find in the conversation.
+            Here is the conversation transcript:
             ---
             {full_context}
             ---
             Has the question "{question['text']}" been answered or addressed in the MOST RECENT part of the conversation, or earlier?
             Dont pay any attention to the diarization because it does not work, try to figure out the answers without
-            taking care of the Speaker indications.
+            taking care of the Speaker indications. For symptoms, consider what is said in the broader sense, don't try and match
+            the question too literally.
             Respond in one of two ways EXACTLY:
             1. If YES (or likely), respond with: YES - [The specific answer extracted from the conversation]
             2. If NO, respond with: NO
@@ -563,7 +568,7 @@ def diarization_correction_thread(unused_processing_queue): # Explicitly mark as
         # If the model fails to load, this thread won't be able to perform corrections.
 
     while True:
-        time.sleep(5) # Check periodically, adjust as needed. Original was 1s.
+        time.sleep(2) # Check periodically, adjust as needed. Original was 1s.
 
         if not diarization_model_instance:
             logging.warning("Diarization correction model not loaded, skipping correction cycle.")
@@ -578,7 +583,7 @@ def diarization_correction_thread(unused_processing_queue): # Explicitly mark as
                 # Take a snapshot of the current conversation history for correction
                 current_conversation_snapshot = "\n".join(conversation_history)
                 logging.info(f"Triggering diarization correction. Segments processed since last: {segment_count}. Total history length approx: {len(current_conversation_snapshot)} chars.")
-                segment_count = 0 # Reset counter immediately after deciding to correct
+                segment_count = 0  # Reset counter immediately after deciding to correct
                 perform_correction = True
 
         if perform_correction and current_conversation_snapshot:
