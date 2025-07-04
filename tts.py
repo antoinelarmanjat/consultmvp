@@ -30,7 +30,7 @@ if __name__ == "__main__":
 <speak>
       <voice name="en-US-Wavenet-D">
         <prosody rate="medium">
-          Hello James, thanks for coming in. Please have a seat. What can I help you with today?
+          Hello James, thanks a lot for coming in. Please have a seat. What can I help you with today?
           <break time="500ms"/>
         </prosody>
       </voice>
